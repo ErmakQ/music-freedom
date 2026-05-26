@@ -1,178 +1,311 @@
-# muzik_maks
+# music-freedom
 
-Веб-приложение: загрузка текстового плейлиста (строки вида «исполнитель - название»), поиск треков и скачивание архива. **Backend:** FastAPI. **Frontend:** React (Vite).
+Веб-приложение для сборки личного музыкального архива из плейлиста.
 
-Старый Telegram-бот и консольный скрипт лежат в папке **[archive/](archive/)** (см. [archive/README.md](archive/README.md)).
+Проект принимает список треков, ищет подходящие mp3-источники, скачивает найденные файлы, проверяет качество совпадения и собирает итоговый архив. Интерфейс показывает прогресс обработки, а рядом с результатом сохраняются диагностические отчёты.
+
+## Что умеет проект
+
+- принимать обычный текстовый плейлист;
+- импортировать плейлист из:
+  - текста;
+  - ссылки или iframe Яндекс Музыки;
+  - сохранённого HTML-файла страницы плейлиста;
+- искать несколько кандидатов для каждого трека;
+- отфильтровывать неподходящие версии:
+  - `clean`;
+  - `censored`;
+  - `radio edit`;
+  - `remix`, `live`, `karaoke`, `instrumental` и другие альтернативные версии, если они не были явно запрошены;
+- сохранять отчёты по качеству совпадений;
+- собирать ZIP только из треков со статусом `OK`.
+
+## Для чего это нужно
+
+Проект полезен, когда у вас есть плейлист, но нет готового архива файлов. Он автоматизирует рутину:
+
+1. получить список треков;
+2. найти подходящие версии;
+3. исключить неподходящие варианты;
+4. скачать найденное;
+5. собрать всё в один архив.
+
+## Что проект не делает
+
+Проект не предназначен для обхода ограничений платформ.
+
+Он:
+
+- не скачивает аудио из Яндекс Музыки;
+- не обходит DRM;
+- не обходит paywall;
+- не выполняет автоматический логин;
+- не обходит авторизацию, антибот-защиту или региональные ограничения.
+
+Яндекс Музыка используется только как источник списка треков и metadata.
+
+## Технологии
+
+- Backend: `FastAPI`
+- Frontend: `React + Vite`
+- Поиск и скачивание: `selenium`, `chromedriver-autoinstaller`, HTTP fallback
+- Проверка mp3 metadata: `mutagen`
 
 ## Требования
 
-- **Python** 3.10+
-- **Google Chrome** и **ChromeDriver** (драйвер подтягивается автоматически под версию Chrome; см. `CHROMEDRIVER_*` в [.env.example](.env.example))
-- **Node.js** 18+ — для сборки и dev-режима фронта
+Перед запуском понадобятся:
 
-## Установка
+- Python `3.10+`
+- Node.js `18+`
+- Google Chrome
+
+ChromeDriver подтягивается автоматически под установленную версию Chrome, если не задан свой путь через переменные окружения.
+
+## Быстрый старт
+
+### 1. Клонирование
 
 ```bash
-cd путь\к\muzik_maks
+git clone <URL_ВАШЕГО_РЕПОЗИТОРИЯ>
+cd music-freedom
+```
+
+### 2. Установка Python-зависимостей
+
+Рекомендуется использовать виртуальное окружение.
+
+Windows:
+
+```bash
+py -m venv .venv
+.venv\Scripts\activate
 py -m pip install -r requirements.txt
+```
+
+macOS / Linux:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
+```
+
+### 3. Подготовка `.env`
+
+Скопируйте шаблон:
+
+Windows:
+
+```bash
 copy .env.example .env
 ```
 
-В `.env` задайте при необходимости `WEB_SESSION_SECRET` и `WEB_CORS_ORIGINS` (пример в `.env.example`).
+macOS / Linux:
 
-## Запуск
+```bash
+cp .env.example .env
+```
 
-**API** (из корня репозитория):
+Минимально полезные переменные:
+
+- `WEB_CORS_ORIGINS` — адрес фронтенда, например `http://localhost:5173`
+- `WEB_SESSION_SECRET` — длинная случайная строка для cookie-сессии
+
+Если вы просто запускаете проект локально для себя, часто достаточно оставить значения по умолчанию из `.env.example` и при необходимости только настроить `WEB_CORS_ORIGINS`.
+
+### 4. Установка frontend-зависимостей
+
+```bash
+cd frontend
+npm install
+cd ..
+```
+
+## Запуск проекта
+
+Нужно открыть два терминала: для API и для frontend.
+
+### Терминал 1: backend
+
+Из корня проекта:
 
 ```bash
 py -m uvicorn web.app:app --host 127.0.0.1 --port 8000
 ```
 
-**Фронт** (отдельный терминал):
+Если у вас не Windows:
+
+```bash
+python3 -m uvicorn web.app:app --host 127.0.0.1 --port 8000
+```
+
+### Терминал 2: frontend
 
 ```bash
 cd frontend
-npm install
 npm run dev
 ```
 
-Открой URL из Vite (обычно `http://localhost:5173`). Прокси на API — порт **8000**.
+После этого откройте адрес, который покажет Vite. Обычно это:
 
-Во время обработки web-интерфейс показывает живой статус задачи: очередь, фазу поиска ссылок, фазу скачивания, текущий трек и итоговую сводку. Когда архив готов, браузер начинает скачивание автоматически.
+```text
+http://localhost:5173
+```
 
-После `npm run build` статика из `frontend/dist` может отдаваться тем же uvicorn на одном порту — открой `http://127.0.0.1:8000`.
+## Продакшн-сборка frontend
 
-Если API на другом origin, в `frontend/.env` задайте `VITE_API_BASE` (см. `frontend/.env.example`).
+```bash
+cd frontend
+npm run build
+```
 
-## Формат плейлиста
+Собранные файлы появятся в `frontend/dist`.
 
-Описание строк и кодировок: **[archive/playlist_format.txt](archive/playlist_format.txt)**.
+## Как пользоваться
 
-## Структура проекта
+### Вариант 1: обычный текстовый плейлист
 
-| Путь | Роль |
-|------|------|
-| `web/app.py` | FastAPI: `/api/process`, лимиты, CORS, сессия |
-| `frontend/` | React UI |
-| `downloader_core.py` | Поиск ссылок и скачивание |
-| `download_service.py` | `DownloadConfig` из `.env` |
-| `playlist_utils.py` | Разбор `.txt` плейлиста |
-| `archive/` | Бот, CLI, примеры (не используются вебом) |
+Вставьте список строк в формате:
+
+```text
+Artist - Title
+Artist - Title
+Artist - Title
+```
+
+Или загрузите `.txt`-файл с таким списком.
+
+### Вариант 2: импорт из Яндекс Музыки
+
+Поддерживается:
+
+- ссылка на плейлист;
+- iframe-код;
+- сохранённый HTML-файл страницы плейлиста.
+
+Лучший результат обычно даёт HTML-файл страницы после прокрутки плейлиста до конца.
+
+Порядок действий:
+
+1. Откройте плейлист в браузере.
+2. Если нужен полный список треков, прокрутите страницу до конца.
+3. Сохраните страницу как HTML.
+4. Загрузите её через интерфейс.
+5. Проверьте preview списка и запустите обработку.
+
+## Как работает quality layer
+
+Проект старается подобрать не просто любой mp3, а максимально подходящую версию трека.
+
+По умолчанию приоритет получают:
+
+- `original`
+- `album version`
+- `full version`
+- `explicit`
+- `uncensored`
+
+По умолчанию отклоняются:
+
+- `clean`
+- `censored`
+- `radio edit`
+- `edited`
+- `safe version`
+- `short version`
+- `preview`
+- `remix`
+- `live`
+- `karaoke`
+- `instrumental`
+- `slowed`
+- `nightcore`
+- `sped up`
+- `cover`
+
+Исключение: если такая версия явно указана во входном треке, она может считаться допустимой.
+
+## Что появляется после обработки
+
+Для каждого прогона проект сохраняет диагностические артефакты, например:
+
+- `quality_report.json`
+- `quality_report.csv`
+- `manual_review.csv`
+- `candidates.json`
+- `accepted/`
+- `rejected/`
+- `result.zip`
+
+В итоговый архив попадают только файлы со статусом `OK`.
+
+## Основные статусы
+
+- `OK`
+- `NOT_FOUND`
+- `DOWNLOAD_FAILED`
+- `LOW_CONFIDENCE_MATCH`
+- `REJECTED_CLEAN_VERSION`
+- `REJECTED_CENSORED_VERSION`
+- `REJECTED_RADIO_VERSION`
+- `REJECTED_REMIX_VERSION`
+- `REJECTED_LIVE_VERSION`
+- `VERSION_MISMATCH`
+- `DURATION_MISMATCH`
+- `SUSPICIOUS_FILE`
+- `NEEDS_MANUAL_REVIEW`
 
 ## Переменные окружения
 
-| Переменная | Назначение |
-|------------|------------|
-| `WEB_CORS_ORIGINS` | Origins фронта через запятую |
-| `WEB_SESSION_SECRET` | Cookie-сессия с `anon_id` (пусто — без неё) |
-| `WEB_SESSION_HTTPS_ONLY` | `1` — cookie только по HTTPS |
-| `WEB_REPORT_LIST_CAP` | Сколько failed/skipped строк в отчёте (10–500) |
-| `WEB_MAX_UPLOAD_BYTES` | Лимит размера загружаемого .txt (в байтах) |
-| `CHROMEDRIVER_PATH` / `CHROMEDRIVER_CACHE_DIR` / … | См. `.env.example` |
-| `HEADLESS`, `WAIT_SEC`, `DELAY`, `MAX_PLAYLIST_LINES` | Поведение Chrome и плейлиста |
-| `SITE_ORIGIN` | Базовый домен сайта для поиска и скачивания (по умолчанию `https://eu.hitmoz.com`) |
-| `LMUSIC_ORIGIN` | Домен fallback-провайдера для ненайденных треков (по умолчанию `https://lmusic.kz`) |
-| `LMUSIC_FALLBACK_ENABLED` | Включить fallback-поиск на `lmusic.kz` для строк, не найденных на основном сайте |
-| `MP3_MIRROR_HOSTS` | Дополнительные зеркала mp3 для fallback во 2 фазе, через запятую |
-| `MAX_CONCURRENT_JOBS` | Одновременные задания на API |
-| `MAX_DOWNLOAD_BYTES` | Лимит размера одного mp3 (0 = без лимита) |
-| `DOWNLOAD_PARALLEL_WORKERS`, `RESOLVE_PARALLEL_WORKERS` | Параллелизм HTTP и Chrome |
-| `SEARCH_TRY_HTTP_FIRST`, `SEARCH_TRANSLIT`, … | См. `.env.example` |
+Основные настройки находятся в [.env.example](.env.example).
 
-Полный список с комментариями — в [.env.example](.env.example).
+Наиболее важные:
 
-## Логи
+- `WEB_CORS_ORIGINS`
+- `WEB_SESSION_SECRET`
+- `WEB_SESSION_HTTPS_ONLY`
+- `WEB_REPORT_LIST_CAP`
+- `WEB_MAX_UPLOAD_BYTES`
+- `HEADLESS`
+- `MAX_PLAYLIST_LINES`
+- `MAX_CONCURRENT_JOBS`
+- `DOWNLOAD_PARALLEL_WORKERS`
+- `RESOLVE_PARALLEL_WORKERS`
+- `LMUSIC_FALLBACK_ENABLED`
+- `MP3_MIRROR_HOSTS`
 
-- **`playlist_web`** — HTTP API.
-- **`playlist_dl`** — загрузка плейлиста (фазы поиска и скачивания).
-- Для CLI каждый прогон пишет `downloaded_music/run_*/run_info.txt` со сводкой по запуску и `downloaded_music/run_*/downloaded.log` с успешно скачанными треками.
-- Для web/API сохраняются только неуспешные прогоны: `downloaded_music/web_runs/run_*/run_info.txt` и `downloaded_music/web_runs/run_*/job.log`.
+## Структура проекта
 
-## Прервать Фазу 2 И Собрать ZIP
+Ключевые части:
 
-Если во время **фазы 2** (HTTP-скачивание файлов) нужно остановить процесс, самый безопасный вариант:
+- `web/app.py` — backend API
+- `frontend/` — React-интерфейс
+- `downloader_core.py` — поиск, выбор кандидатов, скачивание
+- `quality.py` — quality layer, scoring, validation, отчёты
+- `playlist_importers/` — импорт текста, iframe, URL и HTML
+- `pack_downloads.py` — упаковка результата
+- `tests/` — тесты
 
-```bash
-Ctrl+C
-py pack_downloads.py
-```
+## Ограничения и важные замечания
 
-По умолчанию будет собран архив **`playlist_partial.zip`** из файлов последнего прогона в папке **`downloaded_music/run_*`**.
+- Проект не гарантирует нахождение 100% треков.
+- Источники могут быть неполными или нестабильными.
+- Некоторые треки будут уходить в `manual_review`.
+- Сохранённый HTML плейлиста может содержать персональные данные профиля. Не публикуйте такие файлы.
 
-Можно указать свои пути:
+## Проверка перед коммитом
 
-```bash
-py pack_downloads.py --source downloaded_music --output my_tracks.zip
-```
+Перед публикацией на GitHub убедитесь, что в репозиторий не попадают локальные данные:
 
-Сообщение **`Could not find platform independent libraries <prefix>`** на Windows часто связано с установкой Python; при проблемах поставьте Python с [python.org](https://www.python.org/downloads/) или вызывайте явную версию: `py -3.12 -m uvicorn ...`.
-## Quality layer
+- `.env`
+- `downloaded_music/`
+- `backups/`
+- `node_modules/`
+- `dist/`
+- локальные папки виртуального окружения
 
-`muzik_maks` теперь проверяет не только сам факт скачивания mp3, но и качество совпадения версии трека. Цель: в итоговый архив должны попадать только подходящие варианты: original, album, full, explicit или uncensored, если пользователь не попросил другую версию явно.
+Для этого в проекте уже настроен `.gitignore`.
 
-По умолчанию отклоняются clean, censored, edited, safe, radio edit/radio version, short/preview/snippet, remix, live, karaoke, instrumental, slowed, reverb, nightcore, sped up, cover, acoustic и demo-версии. Если такая версия указана во входной строке плейлиста, она считается допустимой для этого трека.
+## Лицензия и использование
 
-Ключевые статусы качества: `OK`, `NOT_FOUND`, `DOWNLOAD_FAILED`, `LOW_CONFIDENCE_MATCH`, `REJECTED_CLEAN_VERSION`, `REJECTED_CENSORED_VERSION`, `REJECTED_RADIO_VERSION`, `REJECTED_EDITED_VERSION`, `REJECTED_SHORT_VERSION`, `REJECTED_REMIX_VERSION`, `REJECTED_LIVE_VERSION`, `REJECTED_KARAOKE_VERSION`, `VERSION_MISMATCH`, `DURATION_MISMATCH`, `SUSPICIOUS_FILE`, `NEEDS_MANUAL_REVIEW`.
-
-Каждый прогон пишет диагностические файлы рядом с результатом: `quality_report.json`, `quality_report.csv`, `manual_review.csv`, `candidates.json`, а скачанные файлы делятся на `accepted/` и `rejected/`. Итоговый ZIP собирается только из `accepted/`, то есть только из файлов со статусом `OK`.
-
-CLI retry-режимы:
-
-```bash
-py archive/scripts.py --retry-failed downloaded_music/run_YYYYMMDD_HHMMSS
-py archive/scripts.py --retry-not-found downloaded_music/run_YYYYMMDD_HHMMSS
-py archive/scripts.py --retry-suspicious downloaded_music/run_YYYYMMDD_HHMMSS
-py archive/scripts.py --retry-manual-review downloaded_music/run_YYYYMMDD_HHMMSS
-py archive/scripts.py --retry-rejected downloaded_music/run_YYYYMMDD_HHMMSS
-```
-
-Ограничения: проект не гарантирует нахождение 100% треков, источники могут быть неполными или отдавать нестабильные ссылки. Логика проекта не обходит DRM, paywall, авторизацию, региональные блокировки или техническую защиту сайтов. `rejected`, `suspicious` и `manual review` означают, что файл не подходит для итогового архива или требует ручной проверки.
-
-## Импорт плейлистов
-
-`muzik_maks` умеет формировать входной плейлист из:
-
-- обычного текстового списка;
-- iframe Яндекс Музыки;
-- ссылки на плейлист Яндекс Музыки;
-- сохраненного HTML-файла страницы плейлиста.
-
-Яндекс Музыка используется только как источник списка треков и metadata. Проект не скачивает аудио из Яндекс Музыки, не выполняет автоматический вход в аккаунт и не обходит DRM, paywall, авторизацию, региональные ограничения или техническую защиту сайтов.
-
-### Как импортировать плейлист Яндекс Музыки
-
-1. Откройте плейлист в браузере.
-2. Если используете iframe, скопируйте iframe-код и вставьте его в поле импорта.
-3. Если нужен полный список треков:
-   - откройте страницу плейлиста;
-   - прокрутите список до конца;
-   - сохраните страницу полностью как HTML;
-   - загрузите HTML-файл в `muzik_maks`.
-4. Проверьте найденный список и preview первых треков.
-5. Запустите обработку.
-
-После импорта создаются:
-
-- `downloaded_music/imports/import_*/imported_playlist.txt`
-- `downloaded_music/imports/import_*/imported_playlist.json`
-- `downloaded_music/imports/import_*/imported_playlist.csv`
-- `downloaded_music/imports/import_*/import_warnings.txt`
-
-CLI:
-
-```bash
-py archive/scripts.py --import-playlist playlist.html
-py archive/scripts.py --import-playlist playlist.html --run
-py archive/scripts.py --import-playlist iframe.txt
-py archive/scripts.py --import-playlist yandex_url.txt
-```
-
-Web API:
-
-```text
-POST /api/import-playlist
-```
-
-Endpoint принимает `multipart/form-data` (`file`, `content`, `run`, `delivery`) или JSON с `content`. Если `run=true`, после импорта создается обычная web-задача обработки.
-
-Сохраненный HTML может содержать персональные данные аккаунта или профиля. Не передавайте такие файлы третьим лицам.
+Используйте проект ответственно и только в рамках законного доступа к источникам. Если вы публикуете репозиторий, отдельно проверьте, что не коммитите локальные данные, сохранённые HTML-страницы с персональной информацией и приватные настройки.
