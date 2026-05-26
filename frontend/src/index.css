@@ -1,0 +1,66 @@
+:root {
+  --bg: #05070d;
+  --bg-2: #080b12;
+  --sidebar: #070a10;
+  --card: rgba(15, 20, 30, 0.92);
+  --card-2: rgba(18, 24, 36, 0.92);
+  --border: rgba(148, 163, 184, 0.14);
+  --border-strong: rgba(168, 85, 247, 0.36);
+  --text: #f8fafc;
+  --text-soft: #cbd5e1;
+  --muted: #94a3b8;
+  --muted-2: #64748b;
+  --purple: #7c3aed;
+  --violet: #8b5cf6;
+  --pink: #ec4899;
+  --orange: #f97316;
+  --green: #22c55e;
+  --blue: #38bdf8;
+  --red: #ef4444;
+  --yellow: #f59e0b;
+  --radius-lg: 24px;
+  --radius-md: 16px;
+  --radius-sm: 10px;
+  font-family: "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  color: var(--text);
+  background: var(--bg);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  min-width: 320px;
+  background: var(--bg);
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background:
+    radial-gradient(ellipse 54% 36% at 20% 8%, rgba(124, 58, 237, 0.12), transparent 70%),
+    radial-gradient(ellipse 44% 36% at 82% 0%, rgba(249, 115, 22, 0.1), transparent 68%),
+    linear-gradient(180deg, var(--bg), var(--bg-2) 48%, var(--bg));
+}
+
+body,
+button,
+input,
+textarea {
+  font-family: inherit;
+}
+
+button {
+  -webkit-tap-highlight-color: transparent;
+}
+
+#root {
+  min-height: 100vh;
+}
