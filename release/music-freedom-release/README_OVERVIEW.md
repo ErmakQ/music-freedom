@@ -168,14 +168,18 @@
 - Python-зависимости ставятся в `.venv`.
 - Приложение запускается через `uvicorn web.app:app --host 127.0.0.1 --port 8000`.
 - Браузер открывается на `http://127.0.0.1:8000`.
-- Google Chrome остается обязательным внешним требованием, потому что Selenium/ChromeDriver используют установленный Chrome.
+- Google Chrome не является обязательным для обычного fast/balanced запуска. Он нужен только для `Глубокий поиск`, `SEARCH_MODE=deep` или `ENABLE_SELENIUM_FALLBACK=true`, потому что Selenium/ChromeDriver используют установленный Chrome.
 
-После проверки на чужом ПК обнаружен кейс: Python installer мог завершиться, но `python.exe` не появлялся строго в `.runtime\python\python.exe`. `start.bat` усилен:
+После проверки на чужом ПК обнаружен кейс: Python installer мог закрывать cmd или завершаться без появления `python.exe` строго в `.runtime\python\python.exe`. Решение изменено: `start.bat` больше не использует `.exe`-installer Python.
 
-- installer запускается через `start /wait`;
-- пишется лог установки `.runtime\python-install.log`;
-- после установки выполняется поиск `python.exe` в `.runtime`, `%LOCALAPPDATA%\Programs\Python` и `%ProgramFiles%\Python311`;
-- найденный Python дополнительно проверяется на версию `3.10+`.
+Текущая схема:
+
+- скачивается официальный nuget-пакет Python `https://www.nuget.org/api/v2/package/python/3.11.9`;
+- пакет сохраняется во временный `.zip`;
+- `Expand-Archive` распаковывает его в `.runtime\python`;
+- локальный Python находится по `.runtime\python\tools\python.exe`;
+- найденный Python дополнительно проверяется на версию `3.10+`;
+- `venv` и `ensurepip` доступны в этом пакете, локальная проверка portable Python `3.11.9` прошла успешно.
 
 Frontend уже поддерживает production-сценарий: после `npm run build` папка `frontend/dist` отдается самим FastAPI через `StaticFiles`. Поэтому для обычного запуска не обязательно держать два терминала и Vite.
 
@@ -188,6 +192,59 @@ Frontend уже поддерживает production-сценарий: после
 - предполагаемый сценарий: собрать ZIP, перенести на другой Windows-ПК, распаковать, запустить `start.bat`.
 
 `.runtime/` добавлен в `.gitignore`, чтобы локально скачанный Python не попадал в репозиторий.
+
+## Search layer
+
+Поиск кандидатов вынесен в отдельный пакет `search/`, без переписывания остального pipeline:
+
+- `search/models.py` — `TrackQuery`, `SearchCandidate`, `ProviderResult`, `SearchDecision`;
+- `search/base.py` — `ProviderBase` с async API `search(track: TrackQuery) -> ProviderResult`;
+- `search/providers.py` — provider-адаптеры `HitmoHTTPProvider`, `LMusicHTTPProvider`, `ZvykiHTTPProvider`, `SeleniumFallbackProvider`;
+- `search/orchestrator.py` — `SearchOrchestrator`;
+- `search/cache.py` — SQLite search cache.
+
+Текущий принцип:
+
+- основной поиск идет через HTTP providers;
+- HTTP providers запускаются async через `asyncio`/`httpx`;
+- кандидаты дедуплицируются перед quality scoring;
+- quality scoring остается старый (`quality.py`);
+- `downloader_core.py` получает тот же список `quality.TrackCandidate` и дальше сохраняет старый pipeline: validation, reports, accepted-only ZIP, CLI/web flow;
+- Selenium fallback выключен по умолчанию и используется только при `ENABLE_SELENIUM_FALLBACK=true`, `SEARCH_MODE=deep` или UI-режиме `Глубокий поиск`;
+- если HTTP дал хороший/high-confidence результат, Selenium не запускается;
+- `candidates.json` теперь содержит `decision_reason`, provider summary и `from_cache`.
+
+Новые env-настройки:
+
+- `ENABLE_SELENIUM_FALLBACK=false`
+- `SEARCH_CACHE_ENABLED=true`
+- `SEARCH_CACHE_TTL_DAYS=14`
+- `HTTP_SEARCH_CONCURRENCY=30`
+- `DOWNLOAD_CONCURRENCY=5`
+- `VALIDATION_CONCURRENCY=4`
+- `SELENIUM_MAX_WORKERS=1`
+- `PROVIDER_TIMEOUT_SEC=8`
+- `SEARCH_MODE=balanced`
+
+Concurrency разделена концептуально:
+
+- HTTP search concurrency — `HTTP_SEARCH_CONCURRENCY`;
+- download concurrency — `DOWNLOAD_CONCURRENCY`;
+- selenium concurrency — `SELENIUM_MAX_WORKERS`;
+- validation concurrency — `VALIDATION_CONCURRENCY`; validation выполняется внутри download path, но ограничивается отдельным semaphore.
+
+UI режимы поиска:
+
+- `Быстро` — HTTP без Chrome;
+- `Баланс` — HTTP + кэш;
+- `Глубокий поиск` — медленнее, разрешает Selenium fallback и может требовать установленный Google Chrome.
+
+Selenium-контракт:
+
+- Selenium/ChromeDriver не удаляется из проекта;
+- в fast/balanced Selenium не используется и отсутствие Chrome не должно ломать обычный запуск;
+- в deep, `SEARCH_MODE=deep` или при `ENABLE_SELENIUM_FALLBACK=true` ChromeDriver поднимается только если HTTP providers не дали high-confidence candidate или достаточное количество candidates;
+- `SELENIUM_MAX_WORKERS` отдельный от `DOWNLOAD_CONCURRENCY`.
 
 ## Диагностика долгих запусков
 
@@ -203,6 +260,16 @@ Frontend уже поддерживает production-сценарий: после
 - для параллельного поиска в progress передается количество уже обработанных phase1-задач (`len(agg)`), а не исходный номер трека;
 - frontend во время `phase1` показывает `Проверено X / total`;
 - `Найдено` во время `phase1` не считается как `total - not_found`, чтобы не создавать ложное ощущение, что все треки уже найдены.
+
+Дополнительная оптимизация после зависания при ручном выборе `Параллельные задачи = 10`:
+
+- ручной параметр `parallel_tasks` больше не меняет `resolve_parallel_workers`; теперь он управляет `parallel_download_workers`;
+- Selenium-поиск выключен в fast/balanced и разрешается только в deep / `ENABLE_SELENIUM_FALLBACK=true`;
+- fast/balanced используют HTTP-first search layer и не требуют Chrome;
+- deep ограничивает Selenium через `SELENIUM_MAX_WORKERS`;
+- в пресеты добавлен `wait_sec` для Selenium fallback;
+- `create_driver` выставляет `page_load_timeout` и `script_timeout` по `wait_sec`;
+- если HTTP providers уже дали high-confidence candidate или достаточно candidates, Selenium/fallback-поиск для этого трека не запускается.
 
 Для анализа зависаний на чужом ПК просить:
 

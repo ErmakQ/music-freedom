@@ -92,6 +92,10 @@ class QualityTests(unittest.TestCase):
         self.assertGreaterEqual(explicit_score, normal_score)
         self.assertFalse(explicit.hard_reject)
 
+    def test_post_download_threshold_is_less_strict_than_search_ok_threshold(self) -> None:
+        self.assertLess(quality.POST_DOWNLOAD_OK_SCORE_THRESHOLD, quality.OK_SCORE_THRESHOLD)
+        self.assertGreaterEqual(quality.POST_DOWNLOAD_OK_SCORE_THRESHOLD, quality.LOW_CONFIDENCE_THRESHOLD)
+
     def test_select_best_candidate_skips_hard_reject(self) -> None:
         clean = candidate("Artist - Song Clean Version")
         original = candidate("Artist - Song")

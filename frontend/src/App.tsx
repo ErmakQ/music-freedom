@@ -24,6 +24,15 @@ type RuntimeConfig = {
   http_search_timeout?: number;
   hitmo_fetch_track_pages?: boolean;
   search_try_http_first?: boolean;
+  wait_sec?: number;
+  provider_timeout_sec?: number;
+  http_search_concurrency?: number;
+  download_concurrency?: number;
+  selenium_max_workers?: number;
+  enable_selenium_fallback?: boolean;
+  search_cache_enabled?: boolean;
+  search_cache_ttl_days?: number;
+  search_mode?: string;
   lmusic_fallback_enabled?: boolean;
   zvyki_fallback_enabled?: boolean;
 };
@@ -33,7 +42,13 @@ type SpeedPreset = {
   resolve_parallel_workers: number;
   delay_sec: number;
   search_load_rounds: number;
+  wait_sec: number;
   http_search_timeout: number;
+  provider_timeout_sec?: number;
+  http_search_concurrency?: number;
+  download_concurrency?: number;
+  selenium_max_workers?: number;
+  enable_selenium_fallback?: boolean;
 };
 
 type QualityCounts = {
@@ -134,7 +149,7 @@ type QualitySettings = {
   rejectLive: boolean;
 };
 type ParallelTasks = "auto" | 3 | 5 | 10;
-type SpeedProfile = "env" | "safe" | "balanced" | "fast";
+type SpeedProfile = "env" | "fast" | "balanced" | "deep";
 type NoticeTone = "status" | "warning";
 type AppModal = "settings" | "help" | "history" | null;
 type ImportSourceKind = "text" | "link" | "iframe" | "html" | "file" | "unknown";
@@ -149,33 +164,52 @@ const fetchApi = (input: string, init?: RequestInit) =>
   fetch(input, { ...init, credentials: "include" });
 
 const SPEED_PREVIEW: Record<Exclude<SpeedProfile, "env">, RuntimeConfig> = {
-  safe: {
-    download_parallel_workers: 8,
-    resolve_parallel_workers: 3,
-    delay_sec: 0.5,
-    search_load_rounds: 3,
-    http_search_timeout: 25,
+  fast: {
+    download_parallel_workers: 10,
+    download_concurrency: 10,
+    resolve_parallel_workers: 8,
+    http_search_concurrency: 30,
+    selenium_max_workers: 0,
+    delay_sec: 0.1,
+    search_load_rounds: 1,
+    wait_sec: 6,
+    http_search_timeout: 8,
+    provider_timeout_sec: 8,
+    enable_selenium_fallback: false,
   },
   balanced: {
-    download_parallel_workers: 10,
-    resolve_parallel_workers: 4,
-    delay_sec: 0.35,
-    search_load_rounds: 3,
-    http_search_timeout: 20,
-  },
-  fast: {
-    download_parallel_workers: 14,
-    resolve_parallel_workers: 5,
-    delay_sec: 0.25,
+    download_parallel_workers: 8,
+    download_concurrency: 8,
+    resolve_parallel_workers: 6,
+    http_search_concurrency: 30,
+    selenium_max_workers: 0,
+    delay_sec: 0.2,
     search_load_rounds: 2,
-    http_search_timeout: 15,
+    wait_sec: 8,
+    http_search_timeout: 8,
+    provider_timeout_sec: 8,
+    enable_selenium_fallback: false,
+  },
+  deep: {
+    download_parallel_workers: 6,
+    download_concurrency: 6,
+    resolve_parallel_workers: 1,
+    http_search_concurrency: 20,
+    selenium_max_workers: 1,
+    delay_sec: 0.5,
+    search_load_rounds: 3,
+    wait_sec: 18,
+    http_search_timeout: 12,
+    provider_timeout_sec: 12,
+    enable_selenium_fallback: true,
   },
 };
 
 function resolveRuntimePreview(base: RuntimeConfig | null, profile: SpeedProfile, parallelTasks: ParallelTasks): RuntimeConfig {
   const runtime = profile === "env" ? { ...(base ?? {}) } : { ...SPEED_PREVIEW[profile] };
   if (parallelTasks !== "auto") {
-    runtime.resolve_parallel_workers = Number(parallelTasks);
+    runtime.download_parallel_workers = Number(parallelTasks);
+    runtime.download_concurrency = Number(parallelTasks);
   }
   return runtime;
 }
@@ -191,9 +225,11 @@ function readUiPrefs(): { delivery: "zip" | "tracks"; parallelTasks: ParallelTas
         ? o.parallelTasks
         : "auto";
     const speedProfile =
-      o.speedProfile === "safe" || o.speedProfile === "balanced" || o.speedProfile === "fast" || o.speedProfile === "env"
-        ? o.speedProfile
-        : "fast";
+      o.speedProfile === "safe"
+        ? "deep"
+        : o.speedProfile === "deep" || o.speedProfile === "balanced" || o.speedProfile === "fast" || o.speedProfile === "env"
+          ? o.speedProfile
+          : "fast";
     return { delivery, parallelTasks, speedProfile };
   } catch {
     return null;
@@ -1039,9 +1075,9 @@ function ArchiveSettingsCard({
   submitImport: (runNow: boolean) => Promise<void>;
 }) {
   const speedProfiles: Array<{ value: SpeedProfile; label: string; hint: string }> = [
-    { value: "safe", label: "Надежно", hint: "меньше ошибок" },
-    { value: "balanced", label: "Баланс", hint: "ровный режим" },
-    { value: "fast", label: "Быстро", hint: "для больших списков" },
+    { value: "fast", label: "Быстро", hint: "HTTP без Chrome" },
+    { value: "balanced", label: "Баланс", hint: "HTTP + кэш" },
+    { value: "deep", label: "Глубокий поиск", hint: "медленнее, может требовать Chrome" },
     { value: "env", label: ".env", hint: "как в настройках" },
   ];
   const activeRuntime = resolveRuntimePreview(runtimeConfig, speedProfile, parallelTasks);
@@ -1079,13 +1115,16 @@ function ArchiveSettingsCard({
             </button>
           ))}
         </div>
+        <p className="field-hint">
+          Быстро и Баланс используют HTTP-поиск без Chrome. Глубокий поиск медленнее: Chrome/Selenium включается только если HTTP-источники не дали уверенного кандидата.
+        </p>
       </div>
 
       <div className="runtime-grid" aria-label="Активные параметры скорости">
-        <div><span>Поиск</span><strong>{activeRuntime?.resolve_parallel_workers ?? "—"} потоков</strong></div>
-        <div><span>Скачивание</span><strong>{activeRuntime?.download_parallel_workers ?? "—"} потоков</strong></div>
+        <div><span>HTTP-поиск</span><strong>{activeRuntime?.http_search_concurrency ?? activeRuntime?.resolve_parallel_workers ?? "—"} потоков</strong></div>
+        <div><span>Скачивание</span><strong>{activeRuntime?.download_concurrency ?? activeRuntime?.download_parallel_workers ?? "—"} потоков</strong></div>
         <div><span>Пауза</span><strong>{activeRuntime?.delay_sec ?? "—"} сек</strong></div>
-        <div><span>Таймаут</span><strong>{activeRuntime?.http_search_timeout ?? "—"} сек</strong></div>
+        <div><span>Chrome fallback</span><strong>{activeRuntime?.enable_selenium_fallback ? `${activeRuntime.selenium_max_workers ?? 1} поток` : "выкл"}</strong></div>
       </div>
 
       <div className="setting-list">
@@ -1096,7 +1135,7 @@ function ArchiveSettingsCard({
         <div className="setting-control">
           <label htmlFor="parallel-tasks">
             <span>Параллельные задачи</span>
-            <small>Больше задач может ускорить обработку, но увеличивает нагрузку и риск ошибок источников.</small>
+            <small>Настраивает параллельное скачивание. Поиск управляется режимом скорости, чтобы Chrome не подвисал.</small>
           </label>
           <select
             id="parallel-tasks"
@@ -1708,6 +1747,10 @@ export default function App() {
     if (job.status === "failed" && job.detail) {
       setError(job.detail);
       setStatus(null);
+      return;
+    }
+    if (job.status === "completed" || job.status === "partial_success") {
+      setError(null);
     }
   }, [job]);
 

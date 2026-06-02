@@ -4,11 +4,11 @@ setlocal EnableExtensions
 cd /d "%~dp0"
 
 set "PYTHON_VERSION=3.11.9"
-set "PYTHON_URL=https://www.python.org/ftp/python/%PYTHON_VERSION%/python-%PYTHON_VERSION%-amd64.exe"
+set "PYTHON_URL=https://www.nuget.org/api/v2/package/python/%PYTHON_VERSION%"
 set "RUNTIME_DIR=%CD%\.runtime"
 set "LOCAL_PYTHON_DIR=%RUNTIME_DIR%\python"
-set "LOCAL_PYTHON_EXE=%LOCAL_PYTHON_DIR%\python.exe"
-set "PYTHON_INSTALL_LOG=%RUNTIME_DIR%\python-install.log"
+set "LOCAL_PYTHON_EXE=%LOCAL_PYTHON_DIR%\tools\python.exe"
+set "PYTHON_PACKAGE=%TEMP%\python-%PYTHON_VERSION%.zip"
 set "VENV_PYTHON=%CD%\.venv\Scripts\python.exe"
 set "FRONTEND_DIST=%CD%\frontend\dist\index.html"
 set "APP_URL=http://127.0.0.1:8000"
@@ -53,39 +53,33 @@ if not errorlevel 1 (
     )
 )
 
-echo Python 3.10+ was not found. Downloading Python %PYTHON_VERSION% locally...
+echo Python 3.10+ was not found. Downloading portable Python %PYTHON_VERSION% locally...
 if not exist "%RUNTIME_DIR%" mkdir "%RUNTIME_DIR%"
 
-set "PYTHON_INSTALLER=%TEMP%\python-%PYTHON_VERSION%-amd64.exe"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '%PYTHON_URL%' -OutFile '%PYTHON_INSTALLER%' } catch { Write-Host $_; exit 1 }"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '%PYTHON_URL%' -OutFile '%PYTHON_PACKAGE%' } catch { Write-Host $_; exit 1 }"
 if errorlevel 1 (
-    echo Failed to download Python installer.
+    echo Failed to download portable Python package.
     pause
     exit /b 1
 )
 
-echo Installing Python into %LOCAL_PYTHON_DIR%
-start /wait "" "%PYTHON_INSTALLER%" /quiet InstallAllUsers=0 TargetDir="%LOCAL_PYTHON_DIR%" Include_launcher=0 PrependPath=0 Include_pip=1 Include_test=0 SimpleInstall=1 /log "%PYTHON_INSTALL_LOG%"
+echo Extracting Python into %LOCAL_PYTHON_DIR%
+if exist "%LOCAL_PYTHON_DIR%" rmdir /s /q "%LOCAL_PYTHON_DIR%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "try { Expand-Archive -LiteralPath '%PYTHON_PACKAGE%' -DestinationPath '%LOCAL_PYTHON_DIR%' -Force } catch { Write-Host $_; exit 1 }"
 if errorlevel 1 (
-    echo Python installer failed.
-    echo Installer log:
-    echo %PYTHON_INSTALL_LOG%
+    echo Failed to extract portable Python package.
     pause
     exit /b 1
 )
 
 call :find_local_python
 if errorlevel 1 (
-    echo Python installer finished, but python.exe was not found.
+    echo Portable Python was extracted, but python.exe was not found.
     echo Checked:
     echo %LOCAL_PYTHON_DIR%
     echo %RUNTIME_DIR%
     echo %LOCALAPPDATA%\Programs\Python
     echo %ProgramFiles%\Python311
-    echo %ProgramFiles(x86)%\Python311
-    echo.
-    echo Installer log:
-    echo %PYTHON_INSTALL_LOG%
     pause
     exit /b 1
 )

@@ -11,6 +11,7 @@ ChromeDriver: при старте определяется версия Chrome, 
 """
 from __future__ import annotations
 
+import asyncio
 import http.cookiejar
 import json
 import logging
@@ -41,6 +42,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 
 import quality as quality_layer
+from playlist_utils import extract_playlist_duration_sec, normalize_playlist_line
 
 _log_write_lock = threading.Lock()
 _chromedriver_install_lock = threading.Lock()
@@ -384,6 +386,16 @@ class DownloadConfig:
     search_transliterate: str = "off"
     # После поиска ссылок в браузере — сколько параллельных HTTP-скачиваний (1 = по очереди)
     parallel_download_workers: int = 10
+    validation_parallel_workers: int = 4
+    http_search_concurrency: int = 30
+    download_concurrency: int = 5
+    selenium_max_workers: int = 1
+    provider_timeout_sec: float = 8.0
+    search_mode: str = "balanced"
+    enable_selenium_fallback: bool = False
+    search_cache_enabled: bool = True
+    search_cache_ttl_days: int = 14
+    search_cache_path: str = ""
     # Fallback-поиск на lmusic.kz для треков, которые не нашлись на основном сайте.
     lmusic_fallback_enabled: bool = True
     zvyki_fallback_enabled: bool = True
@@ -415,6 +427,7 @@ class ResolvedTrack:
     candidates: list[quality_layer.TrackCandidate] = field(default_factory=list)
     requested_flags: list[str] = field(default_factory=list)
     generated_queries: list[str] = field(default_factory=list)
+    expected_duration_sec: int | None = None
 
 
 def sanitize_filename(name: str) -> str:
@@ -1165,6 +1178,8 @@ def collect_quality_candidates_for_line(
                     hp,
                     seen_urls,
                 )
+                if len(candidates) >= 3:
+                    break
             else:
                 diag.append(f"hitmo:http:{song_query}=miss")
 
@@ -1224,14 +1239,34 @@ def _candidate_report_entry(
     requested_flags: list[str],
     generated_queries: list[str],
     candidates: list[quality_layer.TrackCandidate],
+    decision_reason: str | None = None,
+    provider_results: list | None = None,
+    from_cache: bool = False,
 ) -> dict:
+    candidate_dicts = []
+    for candidate in candidates:
+        data = quality_layer.candidate_to_dict(candidate) or {}
+        extra_reason = getattr(candidate, "decision_reason", None)
+        if extra_reason:
+            data["decision_reason"] = extra_reason
+        candidate_dicts.append(data)
     return {
         "input_track": raw_song_query,
         "requested_flags": requested_flags,
         "generated_queries": generated_queries,
-        "candidates": [
-            quality_layer.candidate_to_dict(candidate) for candidate in candidates
+        "decision_reason": decision_reason,
+        "from_cache": from_cache,
+        "provider_results": [
+            {
+                "provider": getattr(result, "provider", ""),
+                "status": getattr(result, "status", ""),
+                "reason": getattr(result, "reason", None),
+                "from_cache": getattr(result, "from_cache", False),
+                "candidate_count": len(getattr(result, "candidates", []) or []),
+            }
+            for result in (provider_results or [])
         ],
+        "candidates": candidate_dicts,
     }
 
 
@@ -1240,13 +1275,47 @@ def _resolve_quality_plan(
     wait: WebDriverWait,
     cfg: DownloadConfig,
     raw_song_query: str,
+    expected_duration_sec: int | None = None,
 ) -> dict:
-    candidates, provider_reason, requested_flags, generated_queries = (
-        collect_quality_candidates_for_line(driver, wait, cfg, raw_song_query)
+    from search import (
+        HitmoHTTPProvider,
+        LMusicHTTPProvider,
+        SearchOrchestrator,
+        SeleniumFallbackProvider,
+        TrackQuery,
+        ZvykiHTTPProvider,
     )
-    selected, select_reason, ranked = quality_layer.select_best_candidate(
-        raw_song_query, candidates
+    from search.cache import SearchCache
+
+    artist, title = parse_artist_title(raw_song_query)
+    requested_flags = sorted(quality_layer.detect_requested_version_flags(raw_song_query))
+    generated_queries = search_query_variants(cfg, raw_song_query)
+    track = TrackQuery(
+        raw=raw_song_query,
+        artist=artist,
+        title=title,
+        expected_duration_sec=expected_duration_sec,
+        generated_queries=generated_queries,
+        requested_flags=requested_flags,
     )
+    cache_path = cfg.search_cache_path or str(Path("downloaded_music") / "search_cache.sqlite3")
+    cache = SearchCache(
+        cache_path,
+        ttl_days=cfg.search_cache_ttl_days,
+        enabled=cfg.search_cache_enabled,
+    )
+    selenium_provider = None
+    if cfg.enable_selenium_fallback and driver is not None and wait is not None:
+        selenium_provider = SeleniumFallbackProvider(cfg, driver, wait)
+    orchestrator = SearchOrchestrator(
+        [HitmoHTTPProvider(cfg), LMusicHTTPProvider(cfg), ZvykiHTTPProvider(cfg)],
+        selenium_provider=selenium_provider,
+        cache=cache,
+        http_concurrency=cfg.http_search_concurrency,
+        enable_selenium_fallback=cfg.enable_selenium_fallback,
+    )
+    decision = asyncio.run(orchestrator.search(track))
+    ranked = decision.candidates
     downloadable = [
         candidate
         for candidate in ranked
@@ -1254,14 +1323,9 @@ def _resolve_quality_plan(
         and candidate.download_url
         and candidate.score >= quality_layer.LOW_CONFIDENCE_THRESHOLD
     ]
-    if downloadable:
-        reason = None
-        status = None
-    else:
-        status = select_reason or quality_layer.STATUS_NOT_FOUND
-        reason = provider_reason if status == quality_layer.STATUS_NOT_FOUND else status
-        if selected is not None:
-            reason = select_reason
+    status = decision.status
+    reason = decision.reason
+    selected = decision.selected_candidate
     return {
         "raw": raw_song_query,
         "download_candidates": downloadable,
@@ -1271,6 +1335,9 @@ def _resolve_quality_plan(
         "generated_queries": generated_queries,
         "status": status,
         "reason": reason,
+        "decision_reason": decision.decision_reason,
+        "provider_results": decision.provider_results,
+        "from_cache": decision.from_cache,
     }
 
 
@@ -1412,7 +1479,10 @@ def _find_lmusic_plan_via_selenium(
 def load_search_results_page(
     driver, wait: WebDriverWait, search_url: str, cfg: DownloadConfig
 ) -> None:
-    driver.get(search_url)
+    try:
+        driver.get(search_url)
+    except TimeoutException:
+        driver.execute_script("window.stop();")
     rounds = max(1, min(6, cfg.search_load_rounds))
     for attempt in range(rounds):
         try:
@@ -1432,7 +1502,10 @@ def load_search_results_page(
         )
         tit = driver.title or ""
         if "Результаты" not in tit and attempt < rounds - 1:
-            driver.refresh()
+            try:
+                driver.refresh()
+            except TimeoutException:
+                driver.execute_script("window.stop();")
             time.sleep(cfg.search_refresh_sleep)
     if not driver.find_elements(By.CSS_SELECTOR, "a.track__download-btn"):
         raise TimeoutException(
@@ -1525,6 +1598,9 @@ def create_driver(cfg: DownloadConfig):
         driver = webdriver.Chrome(service=Service(cd_path), options=options)
     else:
         driver = webdriver.Chrome(options=options)
+    timeout = max(5, int(cfg.wait_sec))
+    driver.set_page_load_timeout(timeout)
+    driver.set_script_timeout(timeout)
     wait = WebDriverWait(driver, cfg.wait_sec)
     return driver, wait
 
@@ -1728,24 +1804,29 @@ def _phase1_resolve_worker(
     total_lines: int,
     on_progress: ProgressCb | None = None,
 ) -> None:
-    driver, wait = create_driver(cfg)
+    driver = None
+    wait = None
+    if cfg.enable_selenium_fallback:
+        driver, wait = create_driver(cfg)
     try:
         while True:
             item = task_queue.get()
             if item is _STOP_WORKER:
                 break
-            i, raw = item
+            i, raw, expected_duration_sec = item
+            worker_kind = "Chrome" if cfg.enable_selenium_fallback else "HTTP"
             log.info(
-                "Фаза 1 #%s/%s [Chrome %s]: поиск… %s",
+                "Фаза 1 #%s/%s [%s %s]: поиск… %s",
                 i,
                 total_lines,
+                worker_kind,
                 worker_id,
                 _track_preview(raw),
             )
             t_resolve = time.monotonic()
             try:
                 try:
-                    resolved_info = _resolve_quality_plan(driver, wait, cfg, raw)
+                    resolved_info = _resolve_quality_plan(driver, wait, cfg, raw, expected_duration_sec)
                 except Exception as exc:
                     log.exception("quality resolve failed for %s", _track_preview(raw))
                     resolved_info = {
@@ -1762,9 +1843,10 @@ def _phase1_resolve_worker(
                     }
             except Exception as exc:
                 log.warning(
-                    "Фаза 1 #%s/%s [Chrome %s]: сбой — %s: %s",
+                    "Фаза 1 #%s/%s [%s %s]: сбой — %s: %s",
                     i,
                     total_lines,
+                    worker_kind,
                     worker_id,
                     _track_preview(raw),
                     exc,
@@ -1783,18 +1865,20 @@ def _phase1_resolve_worker(
                 }
             if resolved_info.get("download_candidates"):
                 log.info(
-                    "Фаза 1 #%s/%s [Chrome %s]: план из %s URL — %s",
+                    "Фаза 1 #%s/%s [%s %s]: план из %s URL — %s",
                     i,
                     total_lines,
+                    worker_kind,
                     worker_id,
                     len(resolved_info.get("download_candidates") or []),
                     _track_preview(raw),
                 )
             else:
                 log.warning(
-                    "Фаза 1 #%s/%s [Chrome %s]: ссылок не найдено — %s",
+                    "Фаза 1 #%s/%s [%s %s]: ссылок не найдено — %s",
                     i,
                     total_lines,
+                    worker_kind,
                     worker_id,
                     _track_preview(raw),
                 )
@@ -1805,7 +1889,8 @@ def _phase1_resolve_worker(
                 on_progress(done_count, total_lines, raw, "resolve")
             _sleep_after_phase1_track(cfg, time.monotonic() - t_resolve)
     finally:
-        driver.quit()
+        if driver is not None:
+            driver.quit()
 
 
 def _run_root_for_download_dir(download_dir: str) -> str:
@@ -1863,6 +1948,7 @@ def _run_resolved_download(
     log_file: str | None,
     cfg: DownloadConfig,
     quiet: bool,
+    validation_sem: threading.Semaphore | None = None,
 ) -> tuple[int, str, str | None, str, str | None, str | None, dict]:
     run_root = _run_root_for_download_dir(download_dir)
     accepted_dir = os.path.join(run_root, "accepted")
@@ -1899,16 +1985,22 @@ def _run_resolved_download(
             )
             continue
 
-        validation = quality_layer.validate_downloaded_file(
-            path,
-            rt.raw_song_query,
-            candidate,
-        )
+        if validation_sem is not None:
+            validation_sem.acquire()
+        try:
+            validation = quality_layer.validate_downloaded_file(
+                path,
+                rt.raw_song_query,
+                candidate,
+            )
+        finally:
+            if validation_sem is not None:
+                validation_sem.release()
         candidate.file_size = validation.file_size
         candidate.bitrate = validation.bitrate
         candidate.duration_sec = validation.duration_sec or candidate.duration_sec
 
-        if validation.ok and candidate.score >= quality_layer.OK_SCORE_THRESHOLD:
+        if validation.ok and candidate.score >= quality_layer.POST_DOWNLOAD_OK_SCORE_THRESHOLD:
             accepted_path = quality_layer.move_file_to_dir(path, accepted_dir)
             _write_success_log(log_file, rt.raw_song_query, used_url)
             item = quality_layer.make_quality_item(
@@ -1930,7 +2022,7 @@ def _run_resolved_download(
             )
 
         status = validation.status if not validation.ok else quality_layer.STATUS_LOW_CONFIDENCE_MATCH
-        reason = validation.reason if not validation.ok else "score_below_ok_threshold"
+        reason = validation.reason if not validation.ok else "post_download_score_below_ok_threshold"
         rejected_path = quality_layer.move_file_to_dir(path, rejected_dir)
         last_item = quality_layer.make_quality_item(
             rt.raw_song_query,
@@ -1979,14 +2071,17 @@ def run_playlist_download(
     { "ok": [(line, path), ...], "failed": [line, ...], "skipped": [line, ...] }
     """
     cfg = cfg or DownloadConfig()
-    pw = cfg.parallel_download_workers
+    pw = cfg.download_concurrency or cfg.parallel_download_workers
     if pw <= 0:
         pw = 10
     pw = max(1, min(32, pw))
     rw = cfg.resolve_parallel_workers
     if rw <= 0:
         rw = 1
-    rw = max(1, min(8, rw))
+    if cfg.enable_selenium_fallback:
+        rw = max(1, min(max(1, cfg.selenium_max_workers), rw))
+    else:
+        rw = max(1, min(16, cfg.http_search_concurrency, rw))
 
     os.makedirs(download_dir, exist_ok=True)
     run_root = _run_root_for_download_dir(download_dir)
@@ -2007,7 +2102,12 @@ def run_playlist_download(
     skipped: list[str] = []
     quality_items: list[dict] = []
     candidates_report: list[dict] = []
-    clean_lines = [ln.strip() for ln in lines if ln.strip()]
+    clean_items = [
+        (normalized, extract_playlist_duration_sec(ln))
+        for ln in lines
+        if (normalized := normalize_playlist_line(ln))
+    ]
+    clean_lines = [item[0] for item in clean_items]
     total = len(clean_lines)
     log.info(
         "Старт: строк=%s, пауза между треками=%ss, фаза1 Chrome=%s, фаза2 HTTP=%s",
@@ -2022,8 +2122,8 @@ def run_playlist_download(
     resolved: list[ResolvedTrack] = []
     resolve_miss = 0
 
-    task_items: list[tuple[int, str]] = []
-    for i, raw in enumerate(clean_lines, 1):
+    task_items: list[tuple[int, str, int | None]] = []
+    for i, (raw, expected_duration_sec) in enumerate(clean_items, 1):
         if raw in skip:
             skipped.append(raw)
             log.info("Фаза 1 %s/%s: пропуск (уже в логе) — %s", i, total, _track_preview(raw))
@@ -2031,26 +2131,35 @@ def run_playlist_download(
                 on_progress(i, total, raw, "skip")
             time.sleep(min(cfg.delay_sec, 0.15))
             continue
-        task_items.append((i, raw))
+        task_items.append((i, raw, expected_duration_sec))
 
     if not task_items:
         log.info("Фаза 1: нечего искать (все строки в пропуске)")
     elif rw <= 1:
-        driver, wait = create_driver(cfg)
+        driver = None
+        wait = None
+        if cfg.enable_selenium_fallback:
+            driver, wait = create_driver(cfg)
         try:
-            log.info("Фаза 1 (Selenium): один Chrome по очереди…")
-            for i, raw in task_items:
+            if cfg.enable_selenium_fallback:
+                log.info("Фаза 1: HTTP providers + Selenium fallback, потоков=%s", rw)
+            else:
+                log.info("Фаза 1: HTTP providers без Selenium, потоков=%s", rw)
+            for i, raw, expected_duration_sec in task_items:
                 if on_progress:
                     on_progress(i, total, raw, "resolve")
                 log.info("Фаза 1 %s/%s: поиск… %s", i, total, _track_preview(raw))
                 t_resolve = time.monotonic()
-                resolved_info = _resolve_quality_plan(driver, wait, cfg, raw)
+                resolved_info = _resolve_quality_plan(driver, wait, cfg, raw, expected_duration_sec)
                 candidates_report.append(
                     _candidate_report_entry(
                         raw,
                         resolved_info["requested_flags"],
                         resolved_info["generated_queries"],
                         resolved_info["all_candidates"],
+                        resolved_info.get("decision_reason"),
+                        resolved_info.get("provider_results"),
+                        bool(resolved_info.get("from_cache")),
                     )
                 )
                 if not resolved_info["download_candidates"]:
@@ -2086,6 +2195,7 @@ def run_playlist_download(
                             candidates=resolved_info["download_candidates"],
                             requested_flags=resolved_info["requested_flags"],
                             generated_queries=resolved_info["generated_queries"],
+                            expected_duration_sec=expected_duration_sec,
                         )
                     )
                     log.info(
@@ -2097,9 +2207,13 @@ def run_playlist_download(
                     )
                 _sleep_after_phase1_track(cfg, time.monotonic() - t_resolve)
         finally:
-            driver.quit()
+            if driver is not None:
+                driver.quit()
     else:
-        log.info("Фаза 1 (Selenium): параллельно %s Chrome…", rw)
+        if cfg.enable_selenium_fallback:
+            log.info("Фаза 1: HTTP providers + Selenium fallback, потоков=%s", rw)
+        else:
+            log.info("Фаза 1: HTTP providers без Selenium, потоков=%s", rw)
         q: Queue = Queue()
         for job in task_items:
             q.put(job)
@@ -2120,7 +2234,7 @@ def run_playlist_download(
             threads.append(t)
         for t in threads:
             t.join()
-        for i, raw in task_items:
+        for i, raw, expected_duration_sec in task_items:
             if i not in agg:
                 log.error(
                     "Фаза 1 #%s/%s: задача не обработана (сбой воркера?) — %s",
@@ -2146,6 +2260,9 @@ def run_playlist_download(
                     resolved_info["requested_flags"],
                     resolved_info["generated_queries"],
                     resolved_info["all_candidates"],
+                    resolved_info.get("decision_reason"),
+                    resolved_info.get("provider_results"),
+                    bool(resolved_info.get("from_cache")),
                 )
             )
             if not resolved_info["download_candidates"]:
@@ -2181,6 +2298,7 @@ def run_playlist_download(
                         candidates=resolved_info["download_candidates"],
                         requested_flags=resolved_info["requested_flags"],
                         generated_queries=resolved_info["generated_queries"],
+                        expected_duration_sec=expected_duration_sec,
                     )
                 )
 
@@ -2193,6 +2311,7 @@ def run_playlist_download(
 
     ok_items: list[tuple[int, str, str]] = []
     quiet_dl = pw > 1
+    validation_sem = threading.Semaphore(max(1, min(32, cfg.validation_parallel_workers)))
 
     if resolved:
         if on_progress:
@@ -2202,7 +2321,7 @@ def run_playlist_download(
             n_done = 0
             for rt in sorted(resolved, key=lambda r: r.playlist_index):
                 _i, raw, path, final_status, error, last_url, quality_item = _run_resolved_download(
-                    rt, download_dir, log_file, cfg, quiet=False
+                    rt, download_dir, log_file, cfg, quiet=False, validation_sem=validation_sem
                 )
                 n_done += 1
                 quality_items.append(quality_item)
@@ -2246,6 +2365,7 @@ def run_playlist_download(
                         log_file,
                         cfg,
                         quiet_dl,
+                        validation_sem,
                     ): rt
                     for rt in resolved
                 }

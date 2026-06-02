@@ -34,7 +34,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from download_service import load_download_config_from_env
 from downloader_core import run_playlist_download
-from playlist_utils import decode_playlist_bytes, effective_max_playlist_lines
+from playlist_utils import decode_playlist_bytes, effective_max_playlist_lines, normalize_playlist_line
 import quality as quality_layer
 from playlist_importers import import_playlist as import_playlist_content
 from playlist_importers import save_imported_playlist
@@ -60,26 +60,35 @@ _WEB_FAILED_RUNS_DIR = _PROJECT_ROOT / "downloaded_music" / "web_runs"
 _WEB_IMPORTS_DIR = _PROJECT_ROOT / "downloaded_music" / "imports"
 
 _SPEED_PRESETS = {
-    "safe": {
-        "download_parallel_workers": 8,
-        "resolve_parallel_workers": 3,
-        "delay_sec": 0.5,
-        "search_load_rounds": 3,
-        "http_search_timeout": 25.0,
+    "fast": {
+        "download_parallel_workers": 10,
+        "resolve_parallel_workers": 8,
+        "delay_sec": 0.1,
+        "search_load_rounds": 1,
+        "wait_sec": 6,
+        "http_search_timeout": 8.0,
+        "enable_selenium_fallback": False,
+        "search_mode": "fast",
     },
     "balanced": {
-        "download_parallel_workers": 10,
-        "resolve_parallel_workers": 4,
-        "delay_sec": 0.35,
-        "search_load_rounds": 3,
-        "http_search_timeout": 20.0,
-    },
-    "fast": {
-        "download_parallel_workers": 14,
-        "resolve_parallel_workers": 5,
-        "delay_sec": 0.25,
+        "download_parallel_workers": 8,
+        "resolve_parallel_workers": 6,
+        "delay_sec": 0.2,
         "search_load_rounds": 2,
-        "http_search_timeout": 15.0,
+        "wait_sec": 8,
+        "http_search_timeout": 8.0,
+        "enable_selenium_fallback": False,
+        "search_mode": "balanced",
+    },
+    "deep": {
+        "download_parallel_workers": 6,
+        "resolve_parallel_workers": 1,
+        "delay_sec": 0.5,
+        "search_load_rounds": 3,
+        "wait_sec": 18,
+        "http_search_timeout": 12.0,
+        "enable_selenium_fallback": True,
+        "search_mode": "deep",
     },
 }
 
@@ -151,8 +160,18 @@ def _runtime_config_payload(cfg=None, speed_profile: str | None = None) -> dict:
         "download_parallel_workers": cfg.parallel_download_workers,
         "resolve_parallel_workers": cfg.resolve_parallel_workers,
         "delay_sec": cfg.delay_sec,
+        "wait_sec": cfg.wait_sec,
         "search_load_rounds": cfg.search_load_rounds,
         "http_search_timeout": cfg.http_search_timeout,
+        "provider_timeout_sec": cfg.provider_timeout_sec,
+        "http_search_concurrency": cfg.http_search_concurrency,
+        "download_concurrency": cfg.download_concurrency,
+        "validation_concurrency": cfg.validation_parallel_workers,
+        "selenium_max_workers": cfg.selenium_max_workers,
+        "enable_selenium_fallback": cfg.enable_selenium_fallback,
+        "search_cache_enabled": cfg.search_cache_enabled,
+        "search_cache_ttl_days": cfg.search_cache_ttl_days,
+        "search_mode": cfg.search_mode,
         "hitmo_fetch_track_pages": cfg.fetch_track_pages_when_search_has_mp3,
         "search_try_http_first": cfg.search_try_http_first,
         "lmusic_fallback_enabled": cfg.lmusic_fallback_enabled,
@@ -162,7 +181,9 @@ def _runtime_config_payload(cfg=None, speed_profile: str | None = None) -> dict:
 
 def _build_run_settings(speed_profile: str, parallel_tasks: str | None) -> dict:
     profile = (speed_profile or "env").strip().lower()
-    if profile not in ("env", "safe", "balanced", "fast"):
+    if profile == "safe":
+        profile = "deep"
+    if profile not in ("env", "fast", "balanced", "deep"):
         profile = "env"
     settings = {"speed_profile": profile, "parallel_tasks": (parallel_tasks or "auto").strip().lower()}
     return settings
@@ -178,12 +199,17 @@ def _apply_run_settings(cfg, run_settings: dict | None):
         cfg.resolve_parallel_workers = int(preset["resolve_parallel_workers"])
         cfg.delay_sec = float(preset["delay_sec"])
         cfg.search_load_rounds = int(preset["search_load_rounds"])
+        cfg.wait_sec = int(preset["wait_sec"])
         cfg.http_search_timeout = float(preset["http_search_timeout"])
+        cfg.provider_timeout_sec = float(preset["http_search_timeout"])
+        cfg.enable_selenium_fallback = bool(preset["enable_selenium_fallback"])
+        cfg.search_mode = str(preset["search_mode"])
         cfg.fetch_track_pages_when_search_has_mp3 = False
         cfg.search_try_http_first = True
     parallel = str(run_settings.get("parallel_tasks") or "auto").lower()
     if parallel in {"3", "5", "10"}:
-        cfg.resolve_parallel_workers = max(1, min(8, int(parallel)))
+        cfg.download_concurrency = max(1, min(16, int(parallel)))
+        cfg.parallel_download_workers = cfg.download_concurrency
     return cfg
 
 
@@ -862,7 +888,7 @@ async def create_job(
             )
 
     lines = decode_playlist_bytes(b"".join(raw_parts))
-    clean = [ln.strip() for ln in lines if ln.strip()]
+    clean = [ln.strip().lstrip("\ufeff") for ln in lines if normalize_playlist_line(ln)]
     if not clean:
         raise HTTPException(400, detail="В файле нет непустых строк")
 
@@ -1014,7 +1040,7 @@ async def process_playlist(
             )
     raw = b"".join(raw_parts)
     lines = decode_playlist_bytes(raw)
-    clean = [ln.strip() for ln in lines if ln.strip()]
+    clean = [ln.strip().lstrip("\ufeff") for ln in lines if normalize_playlist_line(ln)]
     if not clean:
         raise HTTPException(400, detail="В файле нет непустых строк")
     cap_lines = effective_max_playlist_lines()

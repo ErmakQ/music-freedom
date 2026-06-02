@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from downloader_core import DEFAULT_LMUSIC_ORIGIN, DEFAULT_SITE_ORIGIN, DEFAULT_ZVYKI_ORIGIN, DownloadConfig
 
@@ -52,6 +53,31 @@ def load_download_config_from_env() -> DownloadConfig:
     if search_translit not in ("off", "replace", "extra"):
         search_translit = "off"
     http_search_tmo = float(os.environ.get("HTTP_SEARCH_TIMEOUT", "25"))
+    enable_selenium = os.environ.get("ENABLE_SELENIUM_FALLBACK", "false").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    search_cache_enabled = os.environ.get("SEARCH_CACHE_ENABLED", "true").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+    search_cache_ttl = int(os.environ.get("SEARCH_CACHE_TTL_DAYS", "14"))
+    http_search_concurrency = max(1, min(100, int(os.environ.get("HTTP_SEARCH_CONCURRENCY", "30"))))
+    download_concurrency = max(1, min(32, int(os.environ.get("DOWNLOAD_CONCURRENCY", str(parallel_dl)))))
+    validation_concurrency = max(1, min(32, int(os.environ.get("VALIDATION_CONCURRENCY", "4"))))
+    selenium_max_workers = max(0, min(4, int(os.environ.get("SELENIUM_MAX_WORKERS", "1"))))
+    provider_timeout = float(os.environ.get("PROVIDER_TIMEOUT_SEC", "8"))
+    search_mode = os.environ.get("SEARCH_MODE", "balanced").strip().lower()
+    if search_mode not in ("fast", "balanced", "deep"):
+        search_mode = "balanced"
+    if search_mode == "deep":
+        enable_selenium = True
+    cache_path = os.environ.get(
+        "SEARCH_CACHE_PATH",
+        str(Path("downloaded_music") / "search_cache.sqlite3"),
+    )
     return DownloadConfig(
         site_origin=site_origin,
         lmusic_origin=lmusic_origin,
@@ -66,6 +92,16 @@ def load_download_config_from_env() -> DownloadConfig:
         search_try_http_first=search_try_http,
         search_transliterate=search_translit,
         http_search_timeout=http_search_tmo,
+        http_search_concurrency=http_search_concurrency,
+        download_concurrency=download_concurrency,
+        validation_parallel_workers=validation_concurrency,
+        selenium_max_workers=selenium_max_workers,
+        provider_timeout_sec=provider_timeout,
+        search_mode=search_mode,
+        enable_selenium_fallback=enable_selenium,
+        search_cache_enabled=search_cache_enabled,
+        search_cache_ttl_days=search_cache_ttl,
+        search_cache_path=cache_path,
         lmusic_fallback_enabled=lmusic_fallback,
         zvyki_fallback_enabled=zvyki_fallback,
     )
