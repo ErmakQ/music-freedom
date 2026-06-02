@@ -350,6 +350,7 @@ CHROME_UA = (
 )
 DEFAULT_SITE_ORIGIN = "https://eu.hitmoz.com"
 DEFAULT_LMUSIC_ORIGIN = "https://lmusic.kz"
+DEFAULT_ZVYKI_ORIGIN = "https://zvyki.com"
 DEFAULT_MP3_MIRROR_HOSTS = (
     "eu.hitmoz.com",
     "eu.hitmotop.com",
@@ -361,6 +362,7 @@ DEFAULT_MP3_MIRROR_HOSTS = (
 class DownloadConfig:
     site_origin: str = DEFAULT_SITE_ORIGIN
     lmusic_origin: str = DEFAULT_LMUSIC_ORIGIN
+    zvyki_origin: str = DEFAULT_ZVYKI_ORIGIN
     headless: bool = True
     wait_sec: int = 25
     delay_sec: float = 0.5
@@ -384,6 +386,7 @@ class DownloadConfig:
     parallel_download_workers: int = 10
     # Fallback-поиск на lmusic.kz для треков, которые не нашлись на основном сайте.
     lmusic_fallback_enabled: bool = True
+    zvyki_fallback_enabled: bool = True
 
 
 _STOP_WORKER = object()
@@ -732,6 +735,157 @@ def _extract_lmusic_track_urls_from_html(html: str, site_origin: str) -> list[st
     return out
 
 
+def _decode_html_bytes(raw_bytes: bytes) -> str:
+    for enc in ("utf-8", "utf-8-sig", "cp1251"):
+        try:
+            return raw_bytes.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw_bytes.decode("utf-8", errors="replace")
+
+
+def _fetch_public_html(url: str, cfg: DownloadConfig) -> tuple[str, str, str] | None:
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    headers = {
+        "User-Agent": cfg.chrome_ua,
+        "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        "Referer": cfg.zvyki_origin.rstrip("/") + "/",
+    }
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with opener.open(req, timeout=cfg.http_search_timeout) as resp:
+            final_url = resp.geturl()
+            raw_bytes = resp.read()
+    except Exception as exc:
+        log.debug("Zvyki HTTP %s: %s", url, exc)
+        return None
+    return _decode_html_bytes(raw_bytes), final_url, http_cookie_header_for_site(jar, cfg.zvyki_origin)
+
+
+def _extract_zvyki_audio_urls(html: str, site_origin: str) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    patterns = [
+        r'https?://[^\s"\'<>]+\.mp3(?:\?[^\s"\'<>]*)?',
+        r'(?:href|src|data-url|data-src)\s*=\s*(["\'])(/[^"\']+\.mp3(?:\?[^"\']*)?)\1',
+        r'(?:href|data-url|data-src)\s*=\s*(["\'])(/[^"\']*(?:download|get)[^"\']*)\1',
+    ]
+    for pattern in patterns:
+        for m in re.finditer(pattern, html, flags=re.I):
+            raw = m.group(0) if m.lastindex is None else m.group(m.lastindex)
+            if raw in ("'", '"'):
+                continue
+            u = urllib.parse.urljoin(site_origin, raw).rstrip(").,;\"'")
+            if u and u not in seen:
+                seen.add(u)
+                out.append(u)
+    return out
+
+
+def _extract_zvyki_track_page_urls(html: str, site_origin: str) -> list[str]:
+    origin = urllib.parse.urlparse(site_origin).netloc.lower()
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in re.finditer(r'href\s*=\s*(["\'])([^"\']+)\1', html, flags=re.I):
+        href = m.group(2).strip()
+        if not href or href.startswith(("#", "javascript:", "mailto:")):
+            continue
+        u = urllib.parse.urljoin(site_origin, href).split("#")[0].rstrip("/")
+        parsed = urllib.parse.urlparse(u)
+        if (parsed.netloc or "").lower() != origin:
+            continue
+        path = parsed.path.lower()
+        if any(skip in path for skip in ("/search", "/privacy", "/contact", "/dmca")):
+            continue
+        if path in ("", "/") or path.endswith(".mp3"):
+            continue
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+        if len(out) >= 8:
+            break
+    return out
+
+
+def _zvyki_search_urls(cfg: DownloadConfig, song_query: str) -> list[str]:
+    origin = cfg.zvyki_origin.rstrip("/")
+    encoded = urllib.parse.quote(song_query, safe="")
+    plus = urllib.parse.quote_plus(song_query)
+    return [
+        f"{origin}/search/?q={encoded}",
+        f"{origin}/search?q={encoded}",
+        f"{origin}/index.php?do=search&subaction=search&story={plus}",
+    ]
+
+
+def try_zvyki_http_plan(
+    cfg: DownloadConfig,
+    raw_song_query: str,
+    song_query: str,
+    artist: str,
+    title: str,
+) -> list[tuple[str, str, str]]:
+    if not cfg.zvyki_fallback_enabled:
+        return []
+
+    attempts: list[tuple[str, str, str]] = []
+    seen_urls: set[str] = set()
+    for search_url in _zvyki_search_urls(cfg, song_query):
+        fetched = _fetch_public_html(search_url, cfg)
+        if not fetched:
+            continue
+        html, final_url, cookie_header = fetched
+        audio_urls = _extract_zvyki_audio_urls(html, cfg.zvyki_origin)
+        if not audio_urls:
+            track_urls = _extract_zvyki_track_page_urls(html, cfg.zvyki_origin)
+            track_urls.sort(
+                key=lambda u: score_mp3_url_path(u, raw_song_query, artist, title),
+                reverse=True,
+            )
+            for track_url in track_urls[:5]:
+                page = _fetch_public_html(track_url, cfg)
+                if not page:
+                    continue
+                page_html, page_url, page_cookie = page
+                scored_audio = [
+                    (audio_url, score_mp3_url_path(audio_url, raw_song_query, artist, title))
+                    for audio_url in _extract_zvyki_audio_urls(page_html, cfg.zvyki_origin)
+                ]
+                scored_audio.sort(key=lambda item: item[1], reverse=True)
+                for audio_url, score in scored_audio:
+                    if score < 40:
+                        continue
+                    if audio_url not in seen_urls:
+                        seen_urls.add(audio_url)
+                        attempts.append((audio_url, page_url, page_cookie or cookie_header))
+                    if len(attempts) >= 5:
+                        break
+                if attempts:
+                    break
+        else:
+            scored_audio = [
+                (audio_url, score_mp3_url_path(audio_url, raw_song_query, artist, title))
+                for audio_url in audio_urls
+            ]
+            scored_audio.sort(key=lambda item: item[1], reverse=True)
+            for audio_url, score in scored_audio[:5]:
+                if score < 40:
+                    continue
+                if audio_url not in seen_urls:
+                    seen_urls.add(audio_url)
+                    attempts.append((audio_url, final_url, cookie_header))
+        if attempts:
+            log.info(
+                "Zvyki fallback: %s url для %s",
+                len(attempts),
+                _track_preview(song_query, 56),
+            )
+            return attempts
+    return attempts
+
+
 def _slugify_lmusic_segment(text: str) -> str:
     base = transliterate_ru_to_latin(text or "")
     base = base.lower()
@@ -1043,6 +1197,19 @@ def collect_quality_candidates_for_line(
             )
         else:
             diag.append(f"lmusic:selenium:{song_query}=miss")
+
+        zp = try_zvyki_http_plan(cfg, raw_song_query, song_query, artist, title)
+        if zp:
+            _append_candidates_from_attempts(
+                candidates,
+                "zvyki:http",
+                raw_song_query,
+                song_query,
+                zp,
+                seen_urls,
+            )
+        else:
+            diag.append(f"zvyki:http:{song_query}=miss")
 
         if len(candidates) >= 20:
             break
@@ -1448,6 +1615,9 @@ def find_download_plan_for_line(
         )
         if lp:
             return lp
+        zp = try_zvyki_http_plan(cfg, raw_song_query, song_query, artist, title)
+        if zp:
+            return zp
     return []
 
 
@@ -1479,6 +1649,10 @@ def diagnose_download_plan_for_line(
         if lp:
             return lp, "lmusic:selenium"
         diag.append(f"lmusic:selenium:{song_query}=miss")
+        zp = try_zvyki_http_plan(cfg, raw_song_query, song_query, artist, title)
+        if zp:
+            return zp, "zvyki:http"
+        diag.append(f"zvyki:http:{song_query}=miss")
     return [], "; ".join(diag[:6]) or "no_provider_match"
 
 

@@ -272,6 +272,8 @@ Artist - Title
 - `DOWNLOAD_PARALLEL_WORKERS`
 - `RESOLVE_PARALLEL_WORKERS`
 - `LMUSIC_FALLBACK_ENABLED`
+- `ZVYKI_ORIGIN`
+- `ZVYKI_FALLBACK_ENABLED`
 - `MP3_MIRROR_HOSTS`
 
 ## Структура проекта
@@ -292,19 +294,6 @@ Artist - Title
 - Источники могут быть неполными или нестабильными.
 - Некоторые треки будут уходить в `manual_review`.
 - Сохранённый HTML плейлиста может содержать персональные данные профиля. Не публикуйте такие файлы.
-
-## Проверка перед коммитом
-
-Перед публикацией на GitHub убедитесь, что в репозиторий не попадают локальные данные:
-
-- `.env`
-- `downloaded_music/`
-- `backups/`
-- `node_modules/`
-- `dist/`
-- локальные папки виртуального окружения
-
-Для этого в проекте уже настроен `.gitignore`.
 
 ## Лицензия и использование
 

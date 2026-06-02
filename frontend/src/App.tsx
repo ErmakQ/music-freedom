@@ -11,6 +11,29 @@ type Limits = {
   max_playlist_lines: number | null;
   max_concurrent_jobs: number;
   session_active?: boolean;
+  runtime_config?: RuntimeConfig;
+  speed_presets?: Record<string, SpeedPreset>;
+};
+
+type RuntimeConfig = {
+  speed_profile?: string;
+  download_parallel_workers?: number;
+  resolve_parallel_workers?: number;
+  delay_sec?: number;
+  search_load_rounds?: number;
+  http_search_timeout?: number;
+  hitmo_fetch_track_pages?: boolean;
+  search_try_http_first?: boolean;
+  lmusic_fallback_enabled?: boolean;
+  zvyki_fallback_enabled?: boolean;
+};
+
+type SpeedPreset = {
+  download_parallel_workers: number;
+  resolve_parallel_workers: number;
+  delay_sec: number;
+  search_load_rounds: number;
+  http_search_timeout: number;
 };
 
 type QualityCounts = {
@@ -65,12 +88,20 @@ type JobInfo = {
   download_ready?: boolean;
   download_name?: string | null;
   saved_run?: string | null;
+  runtime_config?: RuntimeConfig | null;
 };
 
 type ImportPreviewTrack = {
   artist?: string | null;
   title: string;
   duration_ms?: number | null;
+  line: string;
+};
+
+type PreviewTrackRow = {
+  artist: string | null;
+  title: string;
+  duration: string | null;
   line: string;
 };
 
@@ -103,7 +134,9 @@ type QualitySettings = {
   rejectLive: boolean;
 };
 type ParallelTasks = "auto" | 3 | 5 | 10;
+type SpeedProfile = "env" | "safe" | "balanced" | "fast";
 type NoticeTone = "status" | "warning";
+type AppModal = "settings" | "help" | "history" | null;
 type ImportSourceKind = "text" | "link" | "iframe" | "html" | "file" | "unknown";
 type ImportAnalysis = {
   kind: ImportSourceKind;
@@ -112,30 +145,64 @@ type ImportAnalysis = {
   messages: string[];
 };
 
-const PREVIEW_SOFT_LIMIT = 120;
-
 const fetchApi = (input: string, init?: RequestInit) =>
   fetch(input, { ...init, credentials: "include" });
 
-function readUiPrefs(): { delivery: "zip" | "tracks"; parallelTasks: ParallelTasks } | null {
+const SPEED_PREVIEW: Record<Exclude<SpeedProfile, "env">, RuntimeConfig> = {
+  safe: {
+    download_parallel_workers: 8,
+    resolve_parallel_workers: 3,
+    delay_sec: 0.5,
+    search_load_rounds: 3,
+    http_search_timeout: 25,
+  },
+  balanced: {
+    download_parallel_workers: 10,
+    resolve_parallel_workers: 4,
+    delay_sec: 0.35,
+    search_load_rounds: 3,
+    http_search_timeout: 20,
+  },
+  fast: {
+    download_parallel_workers: 14,
+    resolve_parallel_workers: 5,
+    delay_sec: 0.25,
+    search_load_rounds: 2,
+    http_search_timeout: 15,
+  },
+};
+
+function resolveRuntimePreview(base: RuntimeConfig | null, profile: SpeedProfile, parallelTasks: ParallelTasks): RuntimeConfig {
+  const runtime = profile === "env" ? { ...(base ?? {}) } : { ...SPEED_PREVIEW[profile] };
+  if (parallelTasks !== "auto") {
+    runtime.resolve_parallel_workers = Number(parallelTasks);
+  }
+  return runtime;
+}
+
+function readUiPrefs(): { delivery: "zip" | "tracks"; parallelTasks: ParallelTasks; speedProfile: SpeedProfile } | null {
   try {
     const s = localStorage.getItem(PREFS_KEY);
     if (!s) return null;
-    const o = JSON.parse(s) as { delivery?: string; parallelTasks?: string | number };
+    const o = JSON.parse(s) as { delivery?: string; parallelTasks?: string | number; speedProfile?: string };
     const delivery = o.delivery === "tracks" ? "tracks" : "zip";
     const parallelTasks =
       o.parallelTasks === 3 || o.parallelTasks === 5 || o.parallelTasks === 10 || o.parallelTasks === "auto"
         ? o.parallelTasks
         : "auto";
-    return { delivery, parallelTasks };
+    const speedProfile =
+      o.speedProfile === "safe" || o.speedProfile === "balanced" || o.speedProfile === "fast" || o.speedProfile === "env"
+        ? o.speedProfile
+        : "fast";
+    return { delivery, parallelTasks, speedProfile };
   } catch {
     return null;
   }
 }
 
-function writeUiPrefs(delivery: "zip" | "tracks", parallelTasks: ParallelTasks) {
+function writeUiPrefs(delivery: "zip" | "tracks", parallelTasks: ParallelTasks, speedProfile: SpeedProfile) {
   try {
-    localStorage.setItem(PREFS_KEY, JSON.stringify({ delivery, parallelTasks }));
+    localStorage.setItem(PREFS_KEY, JSON.stringify({ delivery, parallelTasks, speedProfile }));
   } catch {
     return;
   }
@@ -248,6 +315,21 @@ function splitTrackLine(line: string) {
   return { artist: "", title: normalized };
 }
 
+function toPreviewTrackRow(track: ImportPreviewTrack): PreviewTrackRow {
+  const parsed = splitTrackLine(track.line);
+  return {
+    artist: track.artist || parsed.artist || null,
+    title: track.title || parsed.title,
+    duration: formatMs(track.duration_ms) || null,
+    line: track.line,
+  };
+}
+
+function toYandexSearchUrl(track: PreviewTrackRow) {
+  const query = `${track.artist ? `${track.artist} ` : ""}${track.title}`.trim();
+  return `https://music.yandex.ru/search?text=${encodeURIComponent(query)}`;
+}
+
 function extractIframeSrc(text: string) {
   const match = text.match(/<iframe[^>]+src=["']([^"']+)["']/i);
   return match?.[1] ?? null;
@@ -324,20 +406,70 @@ function isTextPreviewFile(file: File | null) {
   return lower.endsWith(".txt") || lower.endsWith(".m3u") || lower.endsWith(".m3u8");
 }
 
-function toPreviewRows(sourceText: string, limit = PREVIEW_SOFT_LIMIT) {
+function toPreviewRows(sourceText: string) {
   return sourceText
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean)
-    .slice(0, limit)
     .map((line) => {
       const parsed = splitTrackLine(line);
       return { ...parsed, duration: "", line };
     });
 }
 
-function Sidebar() {
-  const nav: Array<{ label: string; href: string; active?: boolean }> = [
+const SETTINGS_EXCLUSION_FILTERS = [
+  {
+    id: "clean",
+    label: "Clean / censored",
+    hint: "clean, censored, edited, safe, без мата",
+    pattern: /\b(clean|censored|edited|safe)\b|без мата|цензур/i,
+  },
+  {
+    id: "radio",
+    label: "Radio edit",
+    hint: "radio edit, radio version, radio mix",
+    pattern: /\bradio\s+(edit|version|mix|cut)\b/i,
+  },
+  {
+    id: "remix",
+    label: "Remix / alternate",
+    hint: "remix, club mix, extended mix",
+    pattern: /\b(remix|club\s+mix|extended\s+mix)\b/i,
+  },
+  {
+    id: "live",
+    label: "Live / acoustic",
+    hint: "live, concert, acoustic",
+    pattern: /\b(live|concert|acoustic)\b|акустик/i,
+  },
+  {
+    id: "short",
+    label: "Short / preview",
+    hint: "short, preview, snippet",
+    pattern: /\b(short|preview|snippet|cut\s+version)\b/i,
+  },
+] as const;
+
+function dedupePreviewRows(rows: PreviewTrackRow[]) {
+  const seen = new Set<string>();
+  return rows.filter((track) => {
+    const key = track.line.trim().toLowerCase().replace(/\s+/g, " ");
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function Sidebar({
+  onOpenSettings,
+  onOpenHelp,
+  onOpenHistory,
+}: {
+  onOpenSettings: () => void;
+  onOpenHelp: () => void;
+  onOpenHistory: () => void;
+}) {
+  const nav: Array<{ label: string; href?: string; active?: boolean; onClick?: () => void }> = [
     { label: "Новый архив", href: "#dashboard", active: true },
     { label: "История архивов", href: "#results" },
     { label: "Настройки", href: "#archive-settings" },
@@ -359,16 +491,28 @@ function Sidebar() {
 
       <nav className="sidebar-nav" aria-label="Разделы">
         {nav.map((item) => (
-          <a className={item.active ? "active" : ""} href={item.href} key={item.label}>
-            <span className="nav-dot" aria-hidden="true" />
-            {item.label}
-          </a>
+          item.href === "#archive-settings" ? (
+            <button className={item.active ? "active" : ""} type="button" onClick={onOpenSettings} key={item.label}>
+              <span className="nav-dot" aria-hidden="true" />
+              {item.label}
+            </button>
+          ) : item.href === "#results" ? (
+            <button className={item.active ? "active" : ""} type="button" onClick={onOpenHistory} key={item.label}>
+              <span className="nav-dot" aria-hidden="true" />
+              {item.label}
+            </button>
+          ) : (
+            <a className={item.active ? "active" : ""} href={item.href} key={item.label}>
+              <span className="nav-dot" aria-hidden="true" />
+              {item.label}
+            </a>
+          )
         ))}
       </nav>
 
       <div className="sidebar-bottom">
         <div className="side-links">
-          <a href="#help">Помощь</a>
+          <button type="button" onClick={onOpenHelp}>Помощь</button>
           <span className="disabled-link">Поддержка</span>
         </div>
         <div className="profile-chip">
@@ -656,43 +800,121 @@ function PlaylistPreviewCard({
   importFile,
   importFileText,
   analysis,
+  importTab,
+  playlistDraft,
+  setPlaylistDraft,
 }: {
   importResult: ImportResponse | null;
   importContent: string;
   importFile: File | null;
   importFileText: string | null;
   analysis: ImportAnalysis;
+  importTab: ImportTab;
+  playlistDraft: PreviewTrackRow[] | null;
+  setPlaylistDraft: Dispatch<SetStateAction<PreviewTrackRow[] | null>>;
 }) {
-  const localPreview = useMemo(() => {
-    if (importFileText) return toPreviewRows(importFileText);
-    if (analysis.kind === "text") return toPreviewRows(importContent);
-    return [];
-  }, [analysis.kind, importContent, importFileText]);
+  const [openMenuIndex, setOpenMenuIndex] = useState<number | null>(null);
+  const [lastRemovedTrack, setLastRemovedTrack] = useState<{ track: PreviewTrackRow; index: number } | null>(null);
+  const [editingIndex, setEditingIndex] = useState<number | null>(null);
+  const [editingLine, setEditingLine] = useState("");
 
-  const preview = useMemo(() => {
+  const localPreview = useMemo<PreviewTrackRow[]>(() => {
+    if (importTab === "file" && importFileText) return toPreviewRows(importFileText);
+    if (importTab === "text" && analysis.kind === "text") return toPreviewRows(importContent);
+    return [];
+  }, [analysis.kind, importContent, importFileText, importTab]);
+
+  const derivedPreview = useMemo<PreviewTrackRow[]>(() => {
     if (importResult?.preview?.length && localPreview.length <= importResult.preview.length) {
-      return importResult.preview.map((track) => ({
-        artist: track.artist || splitTrackLine(track.line).artist,
-        title: track.title || splitTrackLine(track.line).title,
-        duration: formatMs(track.duration_ms),
-        line: track.line,
-      }));
+      return importResult.preview.map(toPreviewTrackRow);
     }
     if (localPreview.length > 0) return localPreview;
     if (importResult?.preview?.length) {
-      return importResult.preview.map((track) => ({
-        artist: track.artist || splitTrackLine(track.line).artist,
-        title: track.title || splitTrackLine(track.line).title,
-        duration: formatMs(track.duration_ms),
-        line: track.line,
-      }));
+      return importResult.preview.map(toPreviewTrackRow);
     }
     return [];
   }, [importResult, localPreview]);
 
-  const count = importResult?.track_count ?? localPreview.length ?? preview.length;
+  const preview = playlistDraft ?? derivedPreview;
+  const count = playlistDraft?.length ?? importResult?.track_count ?? localPreview.length ?? derivedPreview.length;
   const shown = preview.length;
   const isTrimmed = count > shown;
+
+  useEffect(() => {
+    setOpenMenuIndex(null);
+    setEditingIndex(null);
+  }, [shown, importResult?.import_id, importTab]);
+
+  const handleRemoveTrack = useCallback(
+    (index: number) => {
+      const baseRows = playlistDraft ?? derivedPreview;
+      const removed = baseRows[index];
+      if (removed) setLastRemovedTrack({ track: removed, index });
+      setPlaylistDraft(baseRows.filter((_, rowIndex) => rowIndex !== index));
+      setOpenMenuIndex(null);
+    },
+    [derivedPreview, playlistDraft, setPlaylistDraft],
+  );
+
+  const handleUndoRemove = useCallback(() => {
+    if (!lastRemovedTrack) return;
+    const baseRows = playlistDraft ?? derivedPreview;
+    const nextRows = [...baseRows];
+    nextRows.splice(Math.min(lastRemovedTrack.index, nextRows.length), 0, lastRemovedTrack.track);
+    setPlaylistDraft(nextRows);
+    setLastRemovedTrack(null);
+  }, [derivedPreview, lastRemovedTrack, playlistDraft, setPlaylistDraft]);
+
+  const handleRemoveDuplicates = useCallback(() => {
+    const baseRows = playlistDraft ?? derivedPreview;
+    const seen = new Set<string>();
+    const nextRows = baseRows.filter((track) => {
+      const key = track.line.trim().toLowerCase().replace(/\s+/g, " ");
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    setPlaylistDraft(nextRows);
+    setOpenMenuIndex(null);
+  }, [derivedPreview, playlistDraft, setPlaylistDraft]);
+
+  const handleStartEdit = useCallback((index: number, track: PreviewTrackRow) => {
+    setEditingIndex(index);
+    setEditingLine(track.line);
+    setOpenMenuIndex(null);
+  }, []);
+
+  const handleSaveEdit = useCallback(() => {
+    if (editingIndex === null) return;
+    const line = editingLine.trim();
+    if (!line) return;
+    const parsed = splitTrackLine(line);
+    const baseRows = playlistDraft ?? derivedPreview;
+    setPlaylistDraft(
+      baseRows.map((track, index) =>
+        index === editingIndex
+          ? {
+              ...track,
+              artist: parsed.artist || null,
+              title: parsed.title,
+              line,
+            }
+          : track,
+      ),
+    );
+    setEditingIndex(null);
+    setEditingLine("");
+  }, [derivedPreview, editingIndex, editingLine, playlistDraft, setPlaylistDraft]);
+
+  const handleCopyTrack = useCallback(async (track: PreviewTrackRow) => {
+    try {
+      await navigator.clipboard.writeText(track.line);
+    } catch {
+      return;
+    } finally {
+      setOpenMenuIndex(null);
+    }
+  }, []);
 
   return (
     <section className="card preview-card">
@@ -707,6 +929,15 @@ function PlaylistPreviewCard({
       {isTrimmed ? <p className="preview-caption">Показаны первые {shown} из {count} треков</p> : null}
 
       {preview.length > 0 ? (
+        <>
+        <div className="preview-tools">
+          <button type="button" onClick={handleUndoRemove} disabled={!lastRemovedTrack}>
+            Вернуть удалённый
+          </button>
+          <button type="button" onClick={handleRemoveDuplicates}>
+            Убрать дубли
+          </button>
+        </div>
         <div className="track-list">
           {preview.map((track, index) => (
             <div className="track-row" key={`${track.line}-${index}`}>
@@ -714,14 +945,58 @@ function PlaylistPreviewCard({
                 <span>{index + 1}</span>
               </div>
               <div className="track-meta">
-                <strong>{track.title || track.line}</strong>
-                <small>{track.artist || "Исполнитель не указан"}</small>
+                {editingIndex === index ? (
+                  <div className="track-edit">
+                    <input
+                      value={editingLine}
+                      onChange={(event) => setEditingLine(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") handleSaveEdit();
+                        if (event.key === "Escape") setEditingIndex(null);
+                      }}
+                      autoFocus
+                    />
+                    <button type="button" onClick={handleSaveEdit}>OK</button>
+                    <button type="button" onClick={() => setEditingIndex(null)}>×</button>
+                  </div>
+                ) : (
+                  <>
+                    <strong>{track.title || track.line}</strong>
+                    <small>{track.artist || "Исполнитель не указан"}</small>
+                  </>
+                )}
               </div>
               {track.duration ? <time>{track.duration}</time> : null}
-              <button type="button" aria-label="Дополнительно">...</button>
+              <div className="track-actions">
+                <button
+                  type="button"
+                  aria-label="Действия с треком"
+                  aria-expanded={openMenuIndex === index}
+                  onClick={() => setOpenMenuIndex((current) => (current === index ? null : index))}
+                >
+                  ...
+                </button>
+                {openMenuIndex === index ? (
+                  <div className="track-actions-menu">
+                    <button type="button" onClick={() => window.open(toYandexSearchUrl(track), "_blank", "noopener,noreferrer")}>
+                      Послушать
+                    </button>
+                    <button type="button" onClick={() => void handleCopyTrack(track)}>
+                      Копировать
+                    </button>
+                    <button type="button" onClick={() => handleStartEdit(index, track)}>
+                      Редактировать
+                    </button>
+                    <button type="button" className="danger" onClick={() => handleRemoveTrack(index)}>
+                      Убрать из списка
+                    </button>
+                  </div>
+                ) : null}
+              </div>
             </div>
           ))}
         </div>
+        </>
       ) : (
         <div className="empty-preview">
           <strong>{importFile ? importFile.name : "Плейлист пока не распознан"}</strong>
@@ -739,8 +1014,11 @@ function PlaylistPreviewCard({
 function ArchiveSettingsCard({
   delivery,
   setDelivery,
+  speedProfile,
+  setSpeedProfile,
   parallelTasks,
   setParallelTasks,
+  runtimeConfig,
   maxParallelTasks,
   isBusy,
   importing,
@@ -749,14 +1027,25 @@ function ArchiveSettingsCard({
 }: {
   delivery: "zip" | "tracks";
   setDelivery: (delivery: "zip" | "tracks") => void;
+  speedProfile: SpeedProfile;
+  setSpeedProfile: (value: SpeedProfile) => void;
   parallelTasks: ParallelTasks;
   setParallelTasks: (value: ParallelTasks) => void;
+  runtimeConfig: RuntimeConfig | null;
   maxParallelTasks: number | null;
   isBusy: boolean;
   importing: boolean;
   hasImportInput: boolean;
   submitImport: (runNow: boolean) => Promise<void>;
 }) {
+  const speedProfiles: Array<{ value: SpeedProfile; label: string; hint: string }> = [
+    { value: "safe", label: "Надежно", hint: "меньше ошибок" },
+    { value: "balanced", label: "Баланс", hint: "ровный режим" },
+    { value: "fast", label: "Быстро", hint: "для больших списков" },
+    { value: "env", label: ".env", hint: "как в настройках" },
+  ];
+  const activeRuntime = resolveRuntimePreview(runtimeConfig, speedProfile, parallelTasks);
+
   return (
     <section className="card archive-card" id="archive-settings">
       <div className="card-head">
@@ -773,6 +1062,30 @@ function ArchiveSettingsCard({
         <button className={delivery === "tracks" ? "active" : ""} type="button" onClick={() => setDelivery("tracks")}>
           ZIP без сжатия MP3
         </button>
+      </div>
+
+      <div className="speed-mode">
+        <span>Режим скорости</span>
+        <div className="speed-mode-grid" role="radiogroup" aria-label="Режим скорости обработки">
+          {speedProfiles.map((profile) => (
+            <button
+              key={profile.value}
+              className={speedProfile === profile.value ? "active" : ""}
+              type="button"
+              onClick={() => setSpeedProfile(profile.value)}
+            >
+              {profile.label}
+              <small>{profile.hint}</small>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="runtime-grid" aria-label="Активные параметры скорости">
+        <div><span>Поиск</span><strong>{activeRuntime?.resolve_parallel_workers ?? "—"} потоков</strong></div>
+        <div><span>Скачивание</span><strong>{activeRuntime?.download_parallel_workers ?? "—"} потоков</strong></div>
+        <div><span>Пауза</span><strong>{activeRuntime?.delay_sec ?? "—"} сек</strong></div>
+        <div><span>Таймаут</span><strong>{activeRuntime?.http_search_timeout ?? "—"} сек</strong></div>
       </div>
 
       <div className="setting-list">
@@ -825,6 +1138,247 @@ function ArchiveSettingsCard({
         {isBusy ? "Сбор уже идет..." : "Запустить сбор и архивирование"}
       </button>
     </section>
+  );
+}
+
+function SettingsModal({
+  onClose,
+  settings,
+  setSettings,
+  playlistDraft,
+  setPlaylistDraft,
+}: {
+  onClose: () => void;
+  settings: QualitySettings;
+  setSettings: Dispatch<SetStateAction<QualitySettings>>;
+  playlistDraft: PreviewTrackRow[] | null;
+  setPlaylistDraft: Dispatch<SetStateAction<PreviewTrackRow[] | null>>;
+}) {
+  const trackCount = playlistDraft?.length ?? 0;
+  const prefer = [
+    ["preferOriginal", "Оригинал"],
+    ["preferExplicit", "Explicit"],
+    ["preferUncensored", "Без цензуры"],
+  ] as const;
+  const reject = [
+    ["rejectClean", "Clean-версии"],
+    ["rejectRadio", "Radio edit"],
+    ["rejectCensored", "Цензурированные"],
+    ["rejectRemix", "Remix без запроса"],
+    ["rejectLive", "Live без запроса"],
+  ] as const;
+
+  const removeByPattern = useCallback(
+    (pattern: RegExp) => {
+      if (!playlistDraft?.length) return;
+      setPlaylistDraft(playlistDraft.filter((track) => !pattern.test(track.line)));
+    },
+    [playlistDraft, setPlaylistDraft],
+  );
+
+  const removeDuplicates = useCallback(() => {
+    if (!playlistDraft?.length) return;
+    setPlaylistDraft(dedupePreviewRows(playlistDraft));
+  }, [playlistDraft, setPlaylistDraft]);
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="modal-panel" role="dialog" aria-modal="true" aria-labelledby="settings-title" onMouseDown={(event) => event.stopPropagation()}>
+        <header className="modal-head">
+          <div>
+            <p className="card-kicker">Отдельное окно</p>
+            <h2 id="settings-title">Настройки проекта</h2>
+            <span>Список загружен: {trackCount ? `${trackCount} треков` : "пока нет треков"}</span>
+          </div>
+          <button className="modal-close" type="button" onClick={onClose} aria-label="Закрыть">×</button>
+        </header>
+
+        <div className="modal-body">
+          <section className="modal-section">
+            <h3>Правила качества</h3>
+            <p>Эти переключатели готовят правила для отбора версий: оригинал, explicit и без цензуры получают приоритет, clean/radio/censored/remix/live можно исключать.</p>
+            <div className="modal-subtitle">Предпочитать</div>
+            <div className="pill-row">
+              {prefer.map(([key, label]) => (
+                <button
+                  className={settings[key] ? "pill active" : "pill"}
+                  key={key}
+                  type="button"
+                  onClick={() => setSettings((prev) => ({ ...prev, [key]: !prev[key] }))}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            <div className="modal-subtitle">Исключать</div>
+            <div className="modal-toggle-grid">
+              {reject.map(([key, label]) => (
+                <label key={key} className="toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={settings[key]}
+                    onChange={() => setSettings((prev) => ({ ...prev, [key]: !prev[key] }))}
+                  />
+                  <span />
+                  {label}
+                </label>
+              ))}
+            </div>
+          </section>
+
+          <section className="modal-section">
+            <h3>Очистка текущего списка</h3>
+            <p>Действия ниже меняют уже распознанный preview-список перед запуском. Это удобно, если в плейлисте есть дубли или версии, которые точно не нужны.</p>
+            <div className="modal-actions">
+              <button type="button" onClick={removeDuplicates} disabled={!playlistDraft?.length}>
+                Убрать дубли
+              </button>
+              {SETTINGS_EXCLUSION_FILTERS.map((filter) => {
+                const matches = playlistDraft?.filter((track) => filter.pattern.test(track.line)).length ?? 0;
+                return (
+                  <button
+                    key={filter.id}
+                    type="button"
+                    onClick={() => removeByPattern(filter.pattern)}
+                    disabled={!matches}
+                    title={filter.hint}
+                  >
+                    Исключить {filter.label} <span>{matches}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </section>
+
+          <section className="modal-section">
+            <h3>Что будет дальше</h3>
+            <p>После изменений нажмите «Запустить сбор и архивирование». В обработку уйдет именно текущий список из предпросмотра, включая удаленные вручную треки и убранные дубли.</p>
+          </section>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function HelpModal({ onClose }: { onClose: () => void }) {
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="modal-panel help-modal-panel" role="dialog" aria-modal="true" aria-labelledby="help-title" onMouseDown={(event) => event.stopPropagation()}>
+        <header className="modal-head">
+          <div>
+            <p className="card-kicker">Справка</p>
+            <h2 id="help-title">Как пользоваться «Музыкой Свободы»</h2>
+            <span>Коротко о ссылках, файлах, preview и запуске архива.</span>
+          </div>
+          <button className="modal-close" type="button" onClick={onClose} aria-label="Закрыть">×</button>
+        </header>
+
+        <div className="modal-body">
+          <section className="modal-section">
+            <h3>Обычный TXT</h3>
+            <ul className="modal-list">
+              <li>Одна строка — один трек: «Исполнитель - Название».</li>
+              <li>TXT, M3U и M3U8 можно загрузить во вкладке «HTML-файл» или вставить текстом.</li>
+              <li>После распознавания список появится в предпросмотре, где треки можно удалить, скопировать или отредактировать.</li>
+            </ul>
+          </section>
+
+          <section className="modal-section">
+            <h3>Ссылка или iframe Яндекс Музыки</h3>
+            <ul className="modal-list">
+              <li>Откройте плейлист в Яндекс Музыке и нажмите «Поделиться».</li>
+              <li>Можно вставить обычную ссылку на плейлист или iframe-код целиком.</li>
+              <li>Поддерживаются адреса вида music.yandex.ru/playlists/..., /users/owner/playlists/kind и /iframe/playlist/owner/kind.</li>
+              <li>Яндекс Музыка используется только как источник списка треков и metadata. Аудио оттуда не скачивается.</li>
+            </ul>
+          </section>
+
+          <section className="modal-section">
+            <h3>HTML-файл страницы</h3>
+            <ul className="modal-list">
+              <li>Если ссылка не отдала полный список, откройте плейлист в браузере, прокрутите его до конца и сохраните страницу как HTML.</li>
+              <li>Загрузите сохраненный HTML-файл в проект. Он может содержать данные профиля, поэтому не передавайте его третьим лицам.</li>
+            </ul>
+          </section>
+
+          <section className="modal-section">
+            <h3>Качество и результат</h3>
+            <ul className="modal-list">
+              <li>По умолчанию проект предпочитает original, explicit и uncensored версии.</li>
+              <li>Clean, radio edit, censored, remix и live можно исключать, если они не указаны во входном треке.</li>
+              <li>В итоговый архив должны попадать только подходящие версии; спорные треки остаются в отчетах и manual review.</li>
+            </ul>
+          </section>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function HistoryModal({
+  onClose,
+  job,
+  report,
+}: {
+  onClose: () => void;
+  job: JobInfo | null;
+  report: PlaylistReport | null;
+}) {
+  const counts = report?.counts ?? job?.report?.counts ?? job?.counts;
+  const quality = report?.quality_counts ?? job?.report?.quality_counts ?? job?.quality_counts;
+  const total = job?.total_lines ?? (counts ? counts.ok + counts.failed + counts.skipped : 0);
+  const rejected =
+    (quality?.rejected_clean_or_censored ?? 0) +
+    (quality?.rejected_radio ?? 0) +
+    (quality?.version_mismatch ?? 0) +
+    (quality?.duration_mismatch ?? 0) +
+    (quality?.suspicious ?? 0);
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="modal-panel help-modal-panel" role="dialog" aria-modal="true" aria-labelledby="history-title" onMouseDown={(event) => event.stopPropagation()}>
+        <header className="modal-head">
+          <div>
+            <p className="card-kicker">История</p>
+            <h2 id="history-title">История архивов</h2>
+            <span>{job ? `Последняя задача: ${job.job_id}` : "Пока в этой сессии нет запущенных архивов"}</span>
+          </div>
+          <button className="modal-close" type="button" onClick={onClose} aria-label="Закрыть">×</button>
+        </header>
+
+        <div className="modal-body">
+          {job ? (
+            <>
+              <section className="modal-section">
+                <h3>Последний запуск</h3>
+                <div className="history-grid">
+                  <div><span>Статус</span><strong>{jobStatusLabel(job.status)}</strong></div>
+                  <div><span>Фаза</span><strong>{jobPhaseLabel(job.phase)}</strong></div>
+                  <div><span>Всего</span><strong>{total || "—"}</strong></div>
+                  <div><span>OK</span><strong>{quality?.downloaded_ok ?? counts?.ok ?? "—"}</strong></div>
+                  <div><span>Не найдено</span><strong>{quality?.not_found ?? "—"}</strong></div>
+                  <div><span>Отклонено</span><strong>{rejected || "—"}</strong></div>
+                </div>
+              </section>
+              <section className="modal-section">
+                <h3>Файлы и папка</h3>
+                <p>Если задача уже завершилась, архив и отчеты доступны в блоке «Результаты». Локальная папка запуска: {job.saved_run || "будет показана после сохранения результата"}.</p>
+                {job.available_reports?.length ? (
+                  <div className="help-tags">
+                    {job.available_reports.map((name) => <span key={name}>{name}</span>)}
+                  </div>
+                ) : null}
+              </section>
+            </>
+          ) : (
+            <section className="modal-section">
+              <h3>Здесь появится последний запуск</h3>
+              <p>После старта обработки это окно покажет статус, количество треков, OK/ошибки/отклонения и список доступных отчетов. Пока backend не хранит отдельную таблицу истории, поэтому показываем историю текущей сессии без добавления новой базы данных.</p>
+            </section>
+          )}
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -997,6 +1551,7 @@ export default function App() {
   const [limits, setLimits] = useState<Limits | null>(null);
   const [delivery, setDelivery] = useState<"zip" | "tracks">(() => savedPrefs?.delivery ?? "zip");
   const [parallelTasks, setParallelTasks] = useState<ParallelTasks>(() => savedPrefs?.parallelTasks ?? "auto");
+  const [speedProfile, setSpeedProfile] = useState<SpeedProfile>(() => savedPrefs?.speedProfile ?? "fast");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
@@ -1010,6 +1565,8 @@ export default function App() {
   const [importFileText, setImportFileText] = useState<string | null>(null);
   const [importing, setImporting] = useState(false);
   const [importResult, setImportResult] = useState<ImportResponse | null>(null);
+  const [playlistDraft, setPlaylistDraft] = useState<PreviewTrackRow[] | null>(null);
+  const [activeModal, setActiveModal] = useState<AppModal>(null);
   const [qualitySettings, setQualitySettings] = useState<QualitySettings>({
     preferOriginal: true,
     preferExplicit: true,
@@ -1022,8 +1579,15 @@ export default function App() {
   });
 
   useEffect(() => {
-    writeUiPrefs(delivery, parallelTasks);
-  }, [delivery, parallelTasks]);
+    writeUiPrefs(delivery, parallelTasks, speedProfile);
+  }, [delivery, parallelTasks, speedProfile]);
+
+  useEffect(() => {
+    setImportResult(null);
+    setPlaylistDraft(null);
+    setStatus(null);
+    setError(null);
+  }, [importTab]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1151,12 +1715,32 @@ export default function App() {
     [importContent, importFile, importTab],
   );
 
+  const activeImportHasInput = importTab === "file" ? Boolean(importFile) : Boolean(importContent.trim());
+
+  const handleImportTabChange = useCallback((nextTab: ImportTab) => {
+    setImportTab(nextTab);
+    setImportResult(null);
+    setPlaylistDraft(null);
+    setStatus(null);
+    setError(null);
+    if (nextTab === "file") {
+      setImportContent("");
+      return;
+    }
+    setImportFile(null);
+    setImportFileText(null);
+  }, []);
+
   const submitImport = useCallback(
     async (runNow: boolean) => {
       setError(null);
       setStatus(null);
       setStatusTone("status");
-      if (!importFile && !importContent.trim()) {
+      const draftContent = playlistDraft?.map((track) => track.line).join("\n").trim() ?? "";
+      const useDraftInput = Boolean(playlistDraft?.length);
+      const useFileInput = !useDraftInput && importTab === "file";
+      const activeContent = useDraftInput ? draftContent : useFileInput ? "" : importContent.trim();
+      if ((useFileInput && !importFile) || (!useFileInput && !activeContent)) {
         setError("Вставьте список, ссылку, iframe или выберите HTML/TXT-файл.");
         return;
       }
@@ -1164,13 +1748,15 @@ export default function App() {
       setImporting(!runNow);
       try {
         const fd = new FormData();
-        if (importFile) {
+        if (useFileInput && importFile) {
           fd.append("file", importFile);
         } else {
-          fd.append("content", importContent);
+          fd.append("content", activeContent);
         }
         fd.append("run", runNow ? "true" : "false");
         fd.append("delivery", delivery);
+        fd.append("speed_profile", speedProfile);
+        fd.append("parallel_tasks", String(parallelTasks));
         const res = await fetchApi(`${API_BASE}/api/import-playlist`, {
           method: "POST",
           body: fd,
@@ -1182,6 +1768,7 @@ export default function App() {
           throw new Error(data.detail || `Импорт завершился с кодом ${res.status}.`);
         }
         setImportResult(data);
+        setPlaylistDraft(data.preview?.length ? data.preview.map(toPreviewTrackRow) : null);
         if (data.job) {
           setJob(data.job);
           setDownloadedJobId(null);
@@ -1207,15 +1794,19 @@ export default function App() {
         setImporting(false);
       }
     },
-    [importAnalysis.kind, importFile, importContent, delivery],
+    [importAnalysis.kind, importFile, importContent, importTab, delivery, playlistDraft, speedProfile, parallelTasks],
   );
 
   const isBusy = submitting || job?.status === "queued" || job?.status === "running";
-  const hasImportInput = Boolean(importFile || importContent.trim());
+  const hasImportInput = playlistDraft ? playlistDraft.length > 0 : activeImportHasInput;
 
   return (
     <div className="app-shell">
-      <Sidebar />
+      <Sidebar
+        onOpenSettings={() => setActiveModal("settings")}
+        onOpenHelp={() => setActiveModal("help")}
+        onOpenHistory={() => setActiveModal("history")}
+      />
       <main className="main-content">
         <Hero />
 
@@ -1228,7 +1819,7 @@ export default function App() {
         <section className="dashboard-grid">
           <ImportCard
             tab={importTab}
-            setTab={setImportTab}
+            setTab={handleImportTabChange}
             importContent={importContent}
             setImportContent={setImportContent}
             importFile={importFile}
@@ -1249,12 +1840,18 @@ export default function App() {
             importFile={importFile}
             importFileText={importFileText}
             analysis={importAnalysis}
+            importTab={importTab}
+            playlistDraft={playlistDraft}
+            setPlaylistDraft={setPlaylistDraft}
           />
           <ArchiveSettingsCard
             delivery={delivery}
             setDelivery={setDelivery}
+            speedProfile={speedProfile}
+            setSpeedProfile={setSpeedProfile}
             parallelTasks={parallelTasks}
             setParallelTasks={setParallelTasks}
+            runtimeConfig={limits?.runtime_config ?? null}
             maxParallelTasks={limits?.max_concurrent_jobs ?? null}
             isBusy={isBusy}
             importing={importing}
@@ -1290,6 +1887,19 @@ export default function App() {
           </section>
         </section>
       </main>
+      {activeModal === "settings" ? (
+        <SettingsModal
+          onClose={() => setActiveModal(null)}
+          settings={qualitySettings}
+          setSettings={setQualitySettings}
+          playlistDraft={playlistDraft}
+          setPlaylistDraft={setPlaylistDraft}
+        />
+      ) : null}
+      {activeModal === "help" ? <HelpModal onClose={() => setActiveModal(null)} /> : null}
+      {activeModal === "history" ? (
+        <HistoryModal onClose={() => setActiveModal(null)} job={job} report={lastReport} />
+      ) : null}
     </div>
   );
 }

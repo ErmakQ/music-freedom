@@ -374,6 +374,8 @@ def _provider_score(provider: str) -> float:
         return 0.74
     if "lmusic" in provider:
         return 0.68
+    if "zvyki" in provider:
+        return 0.64
     return 0.60
 
 

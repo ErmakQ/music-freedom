@@ -59,6 +59,30 @@ _MAX_IMPORT_UPLOAD_BYTES = max(0, int(os.getenv("WEB_IMPORT_MAX_UPLOAD_BYTES", "
 _WEB_FAILED_RUNS_DIR = _PROJECT_ROOT / "downloaded_music" / "web_runs"
 _WEB_IMPORTS_DIR = _PROJECT_ROOT / "downloaded_music" / "imports"
 
+_SPEED_PRESETS = {
+    "safe": {
+        "download_parallel_workers": 8,
+        "resolve_parallel_workers": 3,
+        "delay_sec": 0.5,
+        "search_load_rounds": 3,
+        "http_search_timeout": 25.0,
+    },
+    "balanced": {
+        "download_parallel_workers": 10,
+        "resolve_parallel_workers": 4,
+        "delay_sec": 0.35,
+        "search_load_rounds": 3,
+        "http_search_timeout": 20.0,
+    },
+    "fast": {
+        "download_parallel_workers": 14,
+        "resolve_parallel_workers": 5,
+        "delay_sec": 0.25,
+        "search_load_rounds": 2,
+        "http_search_timeout": 15.0,
+    },
+}
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -120,13 +144,58 @@ def _touch_session(request: Request) -> str | None:
     return str(request.session["anon_id"])
 
 
+def _runtime_config_payload(cfg=None, speed_profile: str | None = None) -> dict:
+    cfg = cfg or load_download_config_from_env()
+    return {
+        "speed_profile": speed_profile or "env",
+        "download_parallel_workers": cfg.parallel_download_workers,
+        "resolve_parallel_workers": cfg.resolve_parallel_workers,
+        "delay_sec": cfg.delay_sec,
+        "search_load_rounds": cfg.search_load_rounds,
+        "http_search_timeout": cfg.http_search_timeout,
+        "hitmo_fetch_track_pages": cfg.fetch_track_pages_when_search_has_mp3,
+        "search_try_http_first": cfg.search_try_http_first,
+        "lmusic_fallback_enabled": cfg.lmusic_fallback_enabled,
+        "zvyki_fallback_enabled": cfg.zvyki_fallback_enabled,
+    }
+
+
+def _build_run_settings(speed_profile: str, parallel_tasks: str | None) -> dict:
+    profile = (speed_profile or "env").strip().lower()
+    if profile not in ("env", "safe", "balanced", "fast"):
+        profile = "env"
+    settings = {"speed_profile": profile, "parallel_tasks": (parallel_tasks or "auto").strip().lower()}
+    return settings
+
+
+def _apply_run_settings(cfg, run_settings: dict | None):
+    if not run_settings:
+        return cfg
+    profile = str(run_settings.get("speed_profile") or "env").lower()
+    preset = _SPEED_PRESETS.get(profile)
+    if preset:
+        cfg.parallel_download_workers = int(preset["download_parallel_workers"])
+        cfg.resolve_parallel_workers = int(preset["resolve_parallel_workers"])
+        cfg.delay_sec = float(preset["delay_sec"])
+        cfg.search_load_rounds = int(preset["search_load_rounds"])
+        cfg.http_search_timeout = float(preset["http_search_timeout"])
+        cfg.fetch_track_pages_when_search_has_mp3 = False
+        cfg.search_try_http_first = True
+    parallel = str(run_settings.get("parallel_tasks") or "auto").lower()
+    if parallel in {"3", "5", "10"}:
+        cfg.resolve_parallel_workers = max(1, min(8, int(parallel)))
+    return cfg
+
+
 def _run_download_sync(
     clean: list[str],
     music_dir: str,
     job_log: str,
     on_progress=None,
+    run_settings: dict | None = None,
 ) -> dict:
     cfg = load_download_config_from_env()
+    cfg = _apply_run_settings(cfg, run_settings)
     return run_playlist_download(
         clean,
         music_dir,
@@ -221,6 +290,7 @@ def _public_job(job: dict) -> dict:
         "download_ready": job.get("download_ready", False),
         "download_name": job.get("download_name"),
         "saved_run": job.get("saved_run"),
+        "runtime_config": job.get("runtime_config"),
     }
 
 
@@ -289,7 +359,14 @@ def _available_report_names_for_root(root: str | None) -> list[str]:
     return [name for name in _REPORT_DOWNLOAD_NAMES if (p / name).is_file()]
 
 
-def _new_job_dict(job_id: str, file_name: str, delivery: str, total_lines: int) -> dict:
+def _new_job_dict(
+    job_id: str,
+    file_name: str,
+    delivery: str,
+    total_lines: int,
+    run_settings: dict | None = None,
+) -> dict:
+    cfg = _apply_run_settings(load_download_config_from_env(), run_settings)
     return {
         "job_id": job_id,
         "status": "queued",
@@ -312,6 +389,11 @@ def _new_job_dict(job_id: str, file_name: str, delivery: str, total_lines: int) 
         "cleanup_after_download": False,
         "saved_run": None,
         "work_root": None,
+        "run_settings": run_settings or {"speed_profile": "env", "parallel_tasks": "auto"},
+        "runtime_config": _runtime_config_payload(
+            cfg,
+            str((run_settings or {}).get("speed_profile") or "env"),
+        ),
     }
 
 
@@ -321,12 +403,13 @@ def _create_processing_job(
     file_name: str,
     delivery: str,
     anon_id: str | None,
+    run_settings: dict | None = None,
 ) -> dict:
     job_id = uuid.uuid4().hex
-    job = _new_job_dict(job_id, file_name, delivery, len(clean))
+    job = _new_job_dict(job_id, file_name, delivery, len(clean), run_settings)
     with app.state.jobs_lock:
         app.state.jobs[job_id] = job
-    asyncio.create_task(_run_job(app, job_id, clean, file_name, delivery, anon_id))
+    asyncio.create_task(_run_job(app, job_id, clean, file_name, delivery, anon_id, run_settings))
     return job
 
 
@@ -383,7 +466,15 @@ def _job_progress_callback(app: FastAPI, job_id: str):
     return on_progress
 
 
-async def _run_job(app: FastAPI, job_id: str, clean: list[str], file_name: str, delivery: str, anon_id: str | None) -> None:
+async def _run_job(
+    app: FastAPI,
+    job_id: str,
+    clean: list[str],
+    file_name: str,
+    delivery: str,
+    anon_id: str | None,
+    run_settings: dict | None = None,
+) -> None:
     work_root = tempfile.mkdtemp(prefix="web_playlist_")
     music_dir = os.path.join(work_root, "music")
     job_log = os.path.join(work_root, "job.log")
@@ -412,7 +503,7 @@ async def _run_job(app: FastAPI, job_id: str, clean: list[str], file_name: str, 
         try:
             result = await loop.run_in_executor(
                 executor,
-                lambda: _run_download_sync(clean, music_dir, job_log, progress_cb),
+                lambda: _run_download_sync(clean, music_dir, job_log, progress_cb, run_settings),
             )
         except Exception as exc:
             log.exception("download failed")
@@ -594,6 +685,8 @@ async def limits(request: Request):
         "max_playlist_lines": effective_max_playlist_lines(),
         "max_concurrent_jobs": MAX_CONCURRENT_JOBS,
         "session_active": WEB_SESSION_ENABLED,
+        "runtime_config": _runtime_config_payload(),
+        "speed_presets": _SPEED_PRESETS,
     }
 
 
@@ -604,6 +697,8 @@ async def import_playlist_endpoint(
     content: str | None = Form(None),
     run: bool = Form(False),
     delivery: str = Form("zip"),
+    speed_profile: str = Form("env"),
+    parallel_tasks: str = Form("auto"),
 ):
     if delivery not in ("zip", "tracks"):
         raise HTTPException(400, detail="delivery должен быть zip или tracks")
@@ -640,6 +735,8 @@ async def import_playlist_endpoint(
             raw_content = str(payload.get("content") or "")
             run = bool(payload.get("run", run))
             delivery = str(payload.get("delivery") or delivery)
+            speed_profile = str(payload.get("speed_profile") or speed_profile)
+            parallel_tasks = str(payload.get("parallel_tasks") or parallel_tasks)
     if raw_content is not None:
         raw_content = raw_content.lstrip("\ufeff")
     if delivery not in ("zip", "tracks"):
@@ -671,7 +768,7 @@ async def import_playlist_endpoint(
             "duration_ms": track.duration_ms,
             "line": track.to_playlist_line(),
         }
-        for track in imported.tracks[:20]
+        for track in imported.tracks
     ]
     file_links = {
         "txt": f"/api/imports/{import_id}/files/imported_playlist.txt",
@@ -708,6 +805,7 @@ async def import_playlist_endpoint(
                 file_name=f"{import_id}:{file_name}",
                 delivery=delivery,
                 anon_id=anon,
+                run_settings=_build_run_settings(speed_profile, parallel_tasks),
             )
             response["job"] = _public_job(job)
     return JSONResponse(status_code=200, content=response)
@@ -736,6 +834,8 @@ async def create_job(
     request: Request,
     file: UploadFile = File(...),
     delivery: str = Form("zip"),
+    speed_profile: str = Form("env"),
+    parallel_tasks: str = Form("auto"),
 ):
     if delivery not in ("zip", "tracks"):
         raise HTTPException(400, detail="delivery должен быть zip или tracks")
@@ -778,6 +878,8 @@ async def create_job(
 
     anon = _touch_session(request)
     job_id = uuid.uuid4().hex
+    run_settings = _build_run_settings(speed_profile, parallel_tasks)
+    runtime_cfg = _apply_run_settings(load_download_config_from_env(), run_settings)
     job = {
         "job_id": job_id,
         "status": "queued",
@@ -800,12 +902,14 @@ async def create_job(
         "cleanup_after_download": False,
         "saved_run": None,
         "work_root": None,
+        "run_settings": run_settings,
+        "runtime_config": _runtime_config_payload(runtime_cfg, run_settings.get("speed_profile")),
     }
     with request.app.state.jobs_lock:
         request.app.state.jobs[job_id] = job
 
     asyncio.create_task(
-        _run_job(request.app, job_id, clean, file.filename or "", delivery, anon)
+        _run_job(request.app, job_id, clean, file.filename or "", delivery, anon, run_settings)
     )
     return JSONResponse(status_code=202, content=_public_job(job))
 

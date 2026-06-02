@@ -5,13 +5,19 @@ from __future__ import annotations
 
 import os
 
-from downloader_core import DEFAULT_LMUSIC_ORIGIN, DEFAULT_SITE_ORIGIN, DownloadConfig
+from downloader_core import DEFAULT_LMUSIC_ORIGIN, DEFAULT_SITE_ORIGIN, DEFAULT_ZVYKI_ORIGIN, DownloadConfig
 
 
 def load_download_config_from_env() -> DownloadConfig:
     site_origin = os.environ.get("SITE_ORIGIN", DEFAULT_SITE_ORIGIN).strip() or DEFAULT_SITE_ORIGIN
     lmusic_origin = os.environ.get("LMUSIC_ORIGIN", DEFAULT_LMUSIC_ORIGIN).strip() or DEFAULT_LMUSIC_ORIGIN
+    zvyki_origin = os.environ.get("ZVYKI_ORIGIN", DEFAULT_ZVYKI_ORIGIN).strip() or DEFAULT_ZVYKI_ORIGIN
     lmusic_fallback = os.environ.get("LMUSIC_FALLBACK_ENABLED", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+    zvyki_fallback = os.environ.get("ZVYKI_FALLBACK_ENABLED", "1").strip().lower() not in (
         "0",
         "false",
         "no",
@@ -49,6 +55,7 @@ def load_download_config_from_env() -> DownloadConfig:
     return DownloadConfig(
         site_origin=site_origin,
         lmusic_origin=lmusic_origin,
+        zvyki_origin=zvyki_origin,
         headless=headless,
         wait_sec=wait_sec,
         delay_sec=delay,
@@ -60,4 +67,5 @@ def load_download_config_from_env() -> DownloadConfig:
         search_transliterate=search_translit,
         http_search_timeout=http_search_tmo,
         lmusic_fallback_enabled=lmusic_fallback,
+        zvyki_fallback_enabled=zvyki_fallback,
     )
