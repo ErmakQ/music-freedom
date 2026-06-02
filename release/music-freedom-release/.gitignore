@@ -1,0 +1,43 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+.runtime/
+venv/
+env/
+Lib/
+site-packages/
+**/site-packages/
+Scripts/
+pyvenv.cfg
+
+# Node / frontend
+node_modules/
+dist/
+build/
+.next/
+.cache/
+coverage/
+
+# IDE
+.idea/
+.vscode/
+
+# logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# project runtime data
+downloaded_music/
+backups/
+archive/
