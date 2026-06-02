@@ -1394,7 +1394,8 @@ function ProgressCard({ job }: { job: JobInfo | null }) {
   const now = Date.now();
   const elapsedMs = startedAt ? Math.max(0, (job?.status === "completed" || job?.status === "partial_success" || job?.status === "failed" ? (updatedAt ?? now) : now) - startedAt) : null;
   const etaMs = elapsedMs && current > 0 && total > current ? (elapsedMs / current) * (total - current) : null;
-  const foundCount = total > 0 && quality?.not_found != null ? Math.max(0, total - quality.not_found) : null;
+  const isSearchPhase = job?.phase === "phase1";
+  const foundCount = !isSearchPhase && total > 0 && quality?.not_found != null ? Math.max(0, total - quality.not_found) : null;
   const downloadedCount = quality?.downloaded_ok ?? job?.counts?.ok ?? null;
   const rejectedCount =
     (quality?.rejected_clean_or_censored ?? 0) +
@@ -1442,7 +1443,7 @@ function ProgressCard({ job }: { job: JobInfo | null }) {
           <dd>{total || "—"}</dd>
         </div>
         <div>
-          <dt>Готово</dt>
+          <dt>{isSearchPhase ? "Проверено" : "Готово"}</dt>
           <dd>{current} / {total}</dd>
         </div>
         <div>

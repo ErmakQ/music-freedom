@@ -1726,6 +1726,7 @@ def _phase1_resolve_worker(
     agg: dict[int, dict],
     lock: threading.Lock,
     total_lines: int,
+    on_progress: ProgressCb | None = None,
 ) -> None:
     driver, wait = create_driver(cfg)
     try:
@@ -1799,6 +1800,9 @@ def _phase1_resolve_worker(
                 )
             with lock:
                 agg[i] = resolved_info
+                done_count = len(agg)
+            if on_progress:
+                on_progress(done_count, total_lines, raw, "resolve")
             _sleep_after_phase1_track(cfg, time.monotonic() - t_resolve)
     finally:
         driver.quit()
@@ -2108,6 +2112,7 @@ def run_playlist_download(
             t = threading.Thread(
                 target=_phase1_resolve_worker,
                 args=(w + 1, cfg, q, agg, lock, total),
+                kwargs={"on_progress": on_progress},
                 name=f"hitmo-resolve-{w + 1}",
                 daemon=False,
             )

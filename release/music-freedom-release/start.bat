@@ -8,6 +8,7 @@ set "PYTHON_URL=https://www.python.org/ftp/python/%PYTHON_VERSION%/python-%PYTHO
 set "RUNTIME_DIR=%CD%\.runtime"
 set "LOCAL_PYTHON_DIR=%RUNTIME_DIR%\python"
 set "LOCAL_PYTHON_EXE=%LOCAL_PYTHON_DIR%\python.exe"
+set "PYTHON_INSTALL_LOG=%RUNTIME_DIR%\python-install.log"
 set "VENV_PYTHON=%CD%\.venv\Scripts\python.exe"
 set "FRONTEND_DIST=%CD%\frontend\dist\index.html"
 set "APP_URL=http://127.0.0.1:8000"
@@ -26,6 +27,11 @@ if not exist ".env" (
 
 if exist "%LOCAL_PYTHON_EXE%" (
     set PYTHON_BOOT="%LOCAL_PYTHON_EXE%"
+    goto :ensure_venv
+)
+
+call :find_local_python
+if not errorlevel 1 (
     goto :ensure_venv
 )
 
@@ -59,21 +65,30 @@ if errorlevel 1 (
 )
 
 echo Installing Python into %LOCAL_PYTHON_DIR%
-"%PYTHON_INSTALLER%" /quiet InstallAllUsers=0 TargetDir="%LOCAL_PYTHON_DIR%" Include_launcher=0 PrependPath=0 Include_pip=1 Include_test=0 SimpleInstall=1
+start /wait "" "%PYTHON_INSTALLER%" /quiet InstallAllUsers=0 TargetDir="%LOCAL_PYTHON_DIR%" Include_launcher=0 PrependPath=0 Include_pip=1 Include_test=0 SimpleInstall=1 /log "%PYTHON_INSTALL_LOG%"
 if errorlevel 1 (
     echo Python installer failed.
+    echo Installer log:
+    echo %PYTHON_INSTALL_LOG%
     pause
     exit /b 1
 )
 
-if not exist "%LOCAL_PYTHON_EXE%" (
-    echo Python was installed, but python.exe was not found at:
-    echo %LOCAL_PYTHON_EXE%
+call :find_local_python
+if errorlevel 1 (
+    echo Python installer finished, but python.exe was not found.
+    echo Checked:
+    echo %LOCAL_PYTHON_DIR%
+    echo %RUNTIME_DIR%
+    echo %LOCALAPPDATA%\Programs\Python
+    echo %ProgramFiles%\Python311
+    echo %ProgramFiles(x86)%\Python311
+    echo.
+    echo Installer log:
+    echo %PYTHON_INSTALL_LOG%
     pause
     exit /b 1
 )
-
-set PYTHON_BOOT="%LOCAL_PYTHON_EXE%"
 
 :ensure_venv
 if not exist "%VENV_PYTHON%" (
@@ -140,3 +155,45 @@ start "" "%APP_URL%"
 echo.
 echo Server stopped.
 pause
+exit /b 0
+
+:find_local_python
+if exist "%LOCAL_PYTHON_EXE%" (
+    "%LOCAL_PYTHON_EXE%" -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>nul
+    if not errorlevel 1 (
+        set PYTHON_BOOT="%LOCAL_PYTHON_EXE%"
+        exit /b 0
+    )
+)
+
+if exist "%RUNTIME_DIR%" (
+    for /r "%RUNTIME_DIR%" %%P in (python.exe) do (
+        "%%P" -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>nul
+        if not errorlevel 1 (
+            set PYTHON_BOOT="%%P"
+            exit /b 0
+        )
+    )
+)
+
+if exist "%LOCALAPPDATA%\Programs\Python" (
+    for /r "%LOCALAPPDATA%\Programs\Python" %%P in (python.exe) do (
+        "%%P" -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>nul
+        if not errorlevel 1 (
+            set PYTHON_BOOT="%%P"
+            exit /b 0
+        )
+    )
+)
+
+if exist "%ProgramFiles%\Python311" (
+    for /r "%ProgramFiles%\Python311" %%P in (python.exe) do (
+        "%%P" -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>nul
+        if not errorlevel 1 (
+            set PYTHON_BOOT="%%P"
+            exit /b 0
+        )
+    )
+)
+
+exit /b 1
