@@ -18,7 +18,7 @@ class TextPlaylistImporter(PlaylistImporter):
             artist = None
             title = line
             if " - " in line:
-                artist, title = line.rsplit(" - ", 1)
+                artist, title = line.split(" - ", 1)
                 artist = artist.strip() or None
                 title = title.strip()
             tracks.append(

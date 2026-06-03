@@ -86,6 +86,7 @@ type ErrBody = {
 
 type JobInfo = {
   job_id: string;
+  parent_job_id?: string | null;
   status: "queued" | "running" | "completed" | "partial_success" | "failed";
   phase: "queued" | "phase1" | "phase2" | "done";
   detail?: string | null;
@@ -98,6 +99,7 @@ type JobInfo = {
   current_track?: string | null;
   counts?: { ok: number; failed: number; skipped: number };
   quality_counts?: QualityCounts;
+  result_summary?: ResultSummary;
   report?: PlaylistReport | null;
   available_reports?: string[];
   download_ready?: boolean;
@@ -111,6 +113,7 @@ type ImportPreviewTrack = {
   title: string;
   duration_ms?: number | null;
   line: string;
+  warnings?: string[];
 };
 
 type PreviewTrackRow = {
@@ -118,6 +121,7 @@ type PreviewTrackRow = {
   title: string;
   duration: string | null;
   line: string;
+  warnings: string[];
 };
 
 type ImportResponse = {
@@ -158,6 +162,102 @@ type ImportAnalysis = {
   label: string;
   sourceUrl?: string | null;
   messages: string[];
+};
+
+type ResultSummary = {
+  total: number;
+  accepted: number;
+  not_found: number;
+  manual_review: number;
+  rejected: number;
+  download_failed: number;
+  suspicious: number;
+};
+
+type ProblemTrack = {
+  track_id: string;
+  index: number;
+  input_line: string;
+  artist?: string | null;
+  title?: string | null;
+  status?: string | null;
+  user_status_label?: string | null;
+  reason?: string | null;
+  decision_reason?: string | null;
+  best_candidate?: {
+    candidate_id?: string;
+    title?: string | null;
+    artist?: string | null;
+    display_title?: string | null;
+    provider?: string | null;
+    source?: string | null;
+    score?: number | null;
+    duration_sec?: number | null;
+    version_flags?: string[];
+    status?: string | null;
+    reject_reason?: string | null;
+    decision_reason?: string | null;
+  } | null;
+  score?: number | null;
+  from_cache?: boolean | null;
+  provider_summary?: Array<{
+    provider: string;
+    status?: string;
+    reason?: string | null;
+    from_cache?: boolean;
+    candidate_count?: number;
+  }>;
+};
+
+type TrackCandidate = {
+  candidate_id: string;
+  title?: string | null;
+  artist?: string | null;
+  display_title?: string | null;
+  provider?: string | null;
+  source?: string | null;
+  score?: number | null;
+  duration_sec?: number | null;
+  version_flags?: string[];
+  status?: string | null;
+  reject_reason?: string | null;
+  decision_reason?: string | null;
+  downloaded_path?: string | null;
+  can_preview?: boolean;
+  can_accept?: boolean;
+};
+
+type ProblemTracksResponse = {
+  job_id: string;
+  summary: ResultSummary;
+  groups: {
+    not_found: ProblemTrack[];
+    manual_review: ProblemTrack[];
+    rejected: ProblemTrack[];
+    download_failed: ProblemTrack[];
+    suspicious: ProblemTrack[];
+  };
+};
+
+type TrackCandidatesResponse = {
+  job_id: string;
+  track_id: string;
+  input_line?: string | null;
+  status?: string | null;
+  user_status_label?: string | null;
+  decision_reason?: string | null;
+  best_candidate?: TrackCandidate | null;
+  candidates: TrackCandidate[];
+};
+
+type RetryRequest = {
+  statuses: string[];
+  track_ids: string[];
+  search_mode: "balanced" | "deep";
+  bypass_cache: boolean;
+  enable_selenium: boolean;
+  provider_timeout_sec: number;
+  custom_queries: Record<string, string>;
 };
 
 const fetchApi = (input: string, init?: RequestInit) =>
@@ -274,6 +374,59 @@ function errBodyToReport(j: ErrBody): PlaylistReport | null {
   };
 }
 
+function resolveResultSummary(job: JobInfo | null, report: PlaylistReport | null): ResultSummary {
+  if (job?.result_summary) return job.result_summary;
+  const total = job?.total_lines ?? ((report?.counts.ok ?? 0) + (report?.counts.failed ?? 0) + (report?.counts.skipped ?? 0));
+  const quality = job?.quality_counts ?? report?.quality_counts;
+  return {
+    total,
+    accepted: quality?.downloaded_ok ?? report?.counts.ok ?? 0,
+    not_found: quality?.not_found ?? 0,
+    manual_review: quality?.manual_review ?? 0,
+    rejected: (quality?.rejected_clean_or_censored ?? 0) + (quality?.rejected_radio ?? 0),
+    download_failed: quality?.download_failed ?? 0,
+    suspicious: quality?.suspicious ?? 0,
+  };
+}
+
+function bestCandidateTitle(track: ProblemTrack) {
+  return track.best_candidate?.display_title || track.best_candidate?.title || "—";
+}
+
+function problemTrackReason(track: ProblemTrack) {
+  return track.reason || track.decision_reason || "—";
+}
+
+function cacheLabel(value?: boolean | null) {
+  if (value == null) return "—";
+  return value ? "Да" : "Нет";
+}
+
+function formatDurationSeconds(value?: number | null) {
+  if (!value || value < 0) return "—";
+  const totalSeconds = Math.round(value);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function previewWarningLabel(code: string) {
+  const labels: Record<string, string> = {
+    extra_dash_in_title: "Лишний дефис в названии",
+    explicit_version_cover: "Явно запрошен Cover",
+    explicit_version_slowed: "Явно запрошен Slowed",
+    explicit_version_remix: "Явно запрошен Remix/Mix",
+    contains_prod_by: "Есть prod. by",
+    contains_unusual_symbols: "Необычные символы",
+    contains_cjk_symbols: "Символы CJK",
+    empty_artist: "Пустой артист",
+    empty_title: "Пустое название",
+    possible_duplicate: "Возможный дубль",
+    short_title: "Короткое название",
+  };
+  return labels[code] || code;
+}
+
 function progressPercent(job: JobInfo | null) {
   if (!job) return 0;
   const total = job.total_lines ?? 0;
@@ -358,6 +511,7 @@ function toPreviewTrackRow(track: ImportPreviewTrack): PreviewTrackRow {
     title: track.title || parsed.title,
     duration: formatMs(track.duration_ms) || null,
     line: track.line,
+    warnings: Array.isArray(track.warnings) ? track.warnings : [],
   };
 }
 
@@ -449,7 +603,7 @@ function toPreviewRows(sourceText: string) {
     .filter(Boolean)
     .map((line) => {
       const parsed = splitTrackLine(line);
-      return { ...parsed, duration: "", line };
+      return { ...parsed, duration: "", line, warnings: [] };
     });
 }
 
@@ -999,6 +1153,15 @@ function PlaylistPreviewCard({
                   <>
                     <strong>{track.title || track.line}</strong>
                     <small>{track.artist || "Исполнитель не указан"}</small>
+                    {track.warnings.length ? (
+                      <div className="preview-warning-list">
+                        {track.warnings.map((warning) => (
+                          <span key={`${track.line}-${warning}`} className="preview-warning-chip">
+                            {previewWarningLabel(warning)}
+                          </span>
+                        ))}
+                      </div>
+                    ) : null}
                   </>
                 )}
               </div>
@@ -1522,7 +1685,7 @@ function ProgressCard({ job }: { job: JobInfo | null }) {
   );
 }
 
-function ResultsCard({
+export function ResultsCard({
   job,
   report,
 }: {
@@ -1586,6 +1749,677 @@ function ResultsCard({
   );
 }
 
+type ProblemTabKey = "not_found" | "manual_review" | "rejected" | "download_failed" | "suspicious";
+
+function CandidateInspectorModal({
+  track,
+  data,
+  loading,
+  error,
+  busy,
+  onAccept,
+  onReject,
+  onClose,
+}: {
+  track: ProblemTrack | null;
+  data: TrackCandidatesResponse | null;
+  loading: boolean;
+  error: string | null;
+  busy: boolean;
+  onAccept: (track: ProblemTrack, candidate: TrackCandidate) => void;
+  onReject: (track: ProblemTrack, candidate: TrackCandidate) => void;
+  onClose: () => void;
+}) {
+  if (!track) return null;
+  const candidates = data?.candidates ?? [];
+
+  return (
+    <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="candidate-inspector-title" onClick={onClose}>
+      <section className="modal-panel candidate-modal-panel" onClick={(event) => event.stopPropagation()}>
+        <header className="modal-head">
+          <div>
+            <p className="card-kicker">Инспектор</p>
+            <h2 id="candidate-inspector-title">Кандидаты для ручной проверки</h2>
+            <span>{track.input_line}</span>
+          </div>
+          <button type="button" className="modal-close" onClick={onClose} aria-label="Закрыть окно">
+            ×
+          </button>
+        </header>
+
+        <div className="candidate-modal-body">
+          <div className="candidate-summary-card">
+            <div>
+              <span>Ожидалось</span>
+              <strong>{track.input_line}</strong>
+            </div>
+            <div>
+              <span>Статус</span>
+              <strong>{track.user_status_label || track.status || "—"}</strong>
+            </div>
+            <div>
+              <span>Причина</span>
+              <strong>{problemTrackReason(track)}</strong>
+            </div>
+          </div>
+
+          {loading ? <div className="problem-tracks-notice" role="status">Загружаем кандидатов…</div> : null}
+          {error ? <div className="problem-tracks-notice" role="status">{error}</div> : null}
+
+          {!loading && !error && !candidates.length ? (
+            <div className="problem-tracks-notice" role="status">Для этого трека кандидаты пока недоступны.</div>
+          ) : null}
+
+          <div className="candidate-grid">
+            {candidates.map((candidate) => (
+              <article className="candidate-card" key={candidate.candidate_id}>
+                <div className="candidate-card-head">
+                  <div>
+                    <p className="card-kicker">Кандидат</p>
+                    <h3>{candidate.display_title || candidate.title || "Без названия"}</h3>
+                  </div>
+                  <span className="count-badge">{candidate.status || "CANDIDATE"}</span>
+                </div>
+
+                <dl className="candidate-meta">
+                  <div>
+                    <dt>Artist</dt>
+                    <dd>{candidate.artist || "—"}</dd>
+                  </div>
+                  <div>
+                    <dt>Source</dt>
+                    <dd>{candidate.source || candidate.provider || "—"}</dd>
+                  </div>
+                  <div>
+                    <dt>Score</dt>
+                    <dd>{typeof candidate.score === "number" ? candidate.score.toFixed(2) : "—"}</dd>
+                  </div>
+                  <div>
+                    <dt>Duration</dt>
+                    <dd>{formatDurationSeconds(candidate.duration_sec)}</dd>
+                  </div>
+                  <div>
+                    <dt>Flags</dt>
+                    <dd>{candidate.version_flags?.length ? candidate.version_flags.join(", ") : "—"}</dd>
+                  </div>
+                  <div>
+                    <dt>Decision</dt>
+                    <dd>{candidate.decision_reason || "—"}</dd>
+                  </div>
+                  <div>
+                    <dt>Reject reason</dt>
+                    <dd>{candidate.reject_reason || "—"}</dd>
+                  </div>
+                </dl>
+
+                <div className="candidate-card-actions">
+                  <button
+                    type="button"
+                    className="button"
+                    disabled={!candidate.can_accept || busy}
+                    onClick={() => onAccept(track, candidate)}
+                  >
+                    Принять вручную
+                  </button>
+                  <button
+                    type="button"
+                    className="button"
+                    disabled={busy}
+                    onClick={() => onReject(track, candidate)}
+                  >
+                    Отклонить
+                  </button>
+                </div>
+              </article>
+            ))}
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function ProblemTracksSection({
+  job,
+  data,
+  loading,
+  error,
+  onRetryNotFound,
+  retryBusy,
+  onManualAccept,
+  onManualReject,
+  onRebuildArchive,
+}: {
+  job: JobInfo | null;
+  data: ProblemTracksResponse | null;
+  loading: boolean;
+  error: string | null;
+  onRetryNotFound: (request: RetryRequest) => void;
+  retryBusy: boolean;
+  onManualAccept: (track: ProblemTrack, candidateId: string) => Promise<void>;
+  onManualReject: (track: ProblemTrack, candidateId: string, reason: string) => Promise<void>;
+  onRebuildArchive: () => Promise<void>;
+}) {
+  const [activeTab, setActiveTab] = useState<ProblemTabKey>("not_found");
+  const [showList, setShowList] = useState(false);
+  const [copyMessage, setCopyMessage] = useState<string | null>(null);
+  const [candidateTrack, setCandidateTrack] = useState<ProblemTrack | null>(null);
+  const [candidateData, setCandidateData] = useState<TrackCandidatesResponse | null>(null);
+  const [candidateLoading, setCandidateLoading] = useState(false);
+  const [candidateError, setCandidateError] = useState<string | null>(null);
+  const [selectedManualTrackIds, setSelectedManualTrackIds] = useState<string[]>([]);
+  const [manualActionBusy, setManualActionBusy] = useState(false);
+  const groups = data?.groups ?? {
+    not_found: [],
+    manual_review: [],
+    rejected: [],
+    download_failed: [],
+    suspicious: [],
+  };
+  const tabs: Array<{ key: ProblemTabKey; label: string }> = [
+    { key: "not_found", label: "Не найдено" },
+    { key: "manual_review", label: "Нужна проверка" },
+    { key: "rejected", label: "Отклонено" },
+    { key: "download_failed", label: "Ошибки скачивания" },
+    { key: "suspicious", label: "Подозрительные" },
+  ];
+  const items = groups[activeTab] ?? [];
+  const notFoundItems = groups.not_found ?? [];
+  const listText = items.map((track) => track.input_line).join("\n");
+  const notFoundListText = notFoundItems.map((track) => track.input_line).join("\n");
+
+  useEffect(() => {
+    setShowList(false);
+    setCopyMessage(null);
+    setSelectedManualTrackIds([]);
+  }, [activeTab, data?.job_id]);
+
+  useEffect(() => {
+    if (!candidateTrack || !job?.job_id) {
+      setCandidateData(null);
+      setCandidateError(null);
+      setCandidateLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    const loadCandidates = async () => {
+      setCandidateLoading(true);
+      setCandidateError(null);
+      try {
+        const res = await fetchApi(`${API_BASE}/api/jobs/${job.job_id}/tracks/${candidateTrack.track_id}/candidates`);
+        if (!res.ok) {
+          throw new Error(`Не удалось получить кандидатов (${res.status})`);
+        }
+        const next = (await res.json()) as TrackCandidatesResponse;
+        if (!cancelled) {
+          setCandidateData(next);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setCandidateData(null);
+          setCandidateError(err instanceof Error ? err.message : "Не удалось загрузить кандидатов.");
+        }
+      } finally {
+        if (!cancelled) {
+          setCandidateLoading(false);
+        }
+      }
+    };
+
+    void loadCandidates();
+    return () => {
+      cancelled = true;
+    };
+  }, [candidateTrack?.track_id, job?.job_id]);
+
+  async function copyText(text: string) {
+    if (!text.trim()) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopyMessage("Список скопирован.");
+    } catch {
+      setCopyMessage("Не удалось скопировать список.");
+    }
+  }
+
+  function toggleManualTrack(trackId: string) {
+    setSelectedManualTrackIds((current) =>
+      current.includes(trackId) ? current.filter((item) => item !== trackId) : [...current, trackId],
+    );
+  }
+
+  async function handleCandidateAccept(track: ProblemTrack, candidate: TrackCandidate) {
+    if (!candidate.candidate_id) return;
+    setManualActionBusy(true);
+    try {
+      await onManualAccept(track, candidate.candidate_id);
+      setCandidateTrack(null);
+      setCopyMessage("Ручное принятие сохранено.");
+    } catch (err) {
+      setCopyMessage(err instanceof Error ? err.message : "Не удалось принять кандидата.");
+    } finally {
+      setManualActionBusy(false);
+    }
+  }
+
+  async function handleCandidateReject(track: ProblemTrack, candidate: TrackCandidate) {
+    if (!candidate.candidate_id) return;
+    const reason = window.prompt("Почему отклоняем кандидата?", candidate.reject_reason || "wrong version");
+    if (reason == null) return;
+    setManualActionBusy(true);
+    try {
+      await onManualReject(track, candidate.candidate_id, reason.trim() || "wrong version");
+      setCandidateTrack(null);
+      setCopyMessage("Ручное отклонение сохранено.");
+    } catch (err) {
+      setCopyMessage(err instanceof Error ? err.message : "Не удалось отклонить кандидата.");
+    } finally {
+      setManualActionBusy(false);
+    }
+  }
+
+  async function handleAcceptSelected() {
+    const selectedTracks = (groups.manual_review ?? []).filter(
+      (track) => selectedManualTrackIds.includes(track.track_id) && track.best_candidate?.candidate_id,
+    );
+    if (!selectedTracks.length) return;
+    setManualActionBusy(true);
+    try {
+      for (const track of selectedTracks) {
+        await onManualAccept(track, String(track.best_candidate?.candidate_id));
+      }
+      setSelectedManualTrackIds([]);
+      setCopyMessage("Выбранные треки приняты вручную.");
+    } catch (err) {
+      setCopyMessage(err instanceof Error ? err.message : "Не удалось принять выбранные треки.");
+    } finally {
+      setManualActionBusy(false);
+    }
+  }
+
+  async function handleRejectSelected() {
+    const selectedTracks = (groups.manual_review ?? []).filter(
+      (track) => selectedManualTrackIds.includes(track.track_id) && track.best_candidate?.candidate_id,
+    );
+    if (!selectedTracks.length) return;
+    const reason = window.prompt("Причина отклонения для выбранных треков", "wrong version");
+    if (reason == null) return;
+    setManualActionBusy(true);
+    try {
+      for (const track of selectedTracks) {
+        await onManualReject(track, String(track.best_candidate?.candidate_id), reason.trim() || "wrong version");
+      }
+      setSelectedManualTrackIds([]);
+      setCopyMessage("Выбранные треки отклонены.");
+    } catch (err) {
+      setCopyMessage(err instanceof Error ? err.message : "Не удалось отклонить выбранные треки.");
+    } finally {
+      setManualActionBusy(false);
+    }
+  }
+
+  async function handleRebuildArchive() {
+    setManualActionBusy(true);
+    try {
+      await onRebuildArchive();
+      setCopyMessage("Архив пересобран.");
+    } catch (err) {
+      setCopyMessage(err instanceof Error ? err.message : "Не удалось пересобрать архив.");
+    } finally {
+      setManualActionBusy(false);
+    }
+  }
+
+  const hasProblems = tabs.some(({ key }) => groups[key].length > 0);
+  const notFoundDownloadHref = job ? `${API_BASE}/api/jobs/${job.job_id}/not-found.txt` : "";
+  const selectedManualTracks = (groups.manual_review ?? []).filter((track) => selectedManualTrackIds.includes(track.track_id));
+  if (!job || (job.status !== "completed" && job.status !== "partial_success" && job.status !== "failed")) {
+    return null;
+  }
+
+  return (
+    <>
+      <section className="card problem-tracks-card">
+        <div className="card-head">
+          <div>
+            <p className="card-kicker">Проверка</p>
+            <h2>Проблемные треки</h2>
+          </div>
+          {loading ? <span className="count-badge">Загружаем</span> : null}
+        </div>
+
+        {error ? <div className="problem-tracks-notice" role="status">{error}</div> : null}
+        {!loading && !error && !hasProblems ? (
+          <div className="problem-tracks-notice" role="status">Проблемных треков не осталось, все найденные файлы уже в архиве.</div>
+        ) : null}
+
+        <div className="problem-tabs" role="tablist" aria-label="Категории проблемных треков">
+          {tabs.map((tab) => (
+            <button key={tab.key} type="button" className={tab.key === activeTab ? "active" : ""} onClick={() => setActiveTab(tab.key)}>
+              <span>{tab.label}</span>
+              <strong>{groups[tab.key].length}</strong>
+            </button>
+          ))}
+        </div>
+
+        {activeTab === "not_found" ? (
+          <div className="problem-toolbar">
+            <button type="button" className="button" onClick={() => setShowList((value) => !value)} disabled={!notFoundItems.length}>
+              {showList ? "Скрыть список" : "Показать список"}
+            </button>
+            <button type="button" className="button" onClick={() => void copyText(notFoundListText)} disabled={!notFoundItems.length}>
+              Скопировать список
+            </button>
+            {notFoundItems.length ? (
+              <a className="button" href={notFoundDownloadHref}>
+                Скачать TXT
+              </a>
+            ) : (
+              <button type="button" className="button" disabled>
+                Скачать TXT
+              </button>
+            )}
+            <button
+              type="button"
+              className="button"
+              disabled={!notFoundItems.length || retryBusy}
+              onClick={() => onRetryNotFound({
+                statuses: ["NOT_FOUND"],
+                track_ids: [],
+                search_mode: "balanced",
+                bypass_cache: false,
+                enable_selenium: false,
+                provider_timeout_sec: 8,
+                custom_queries: {},
+              })}
+            >
+              Повторить все
+            </button>
+            <button
+              type="button"
+              className="button"
+              disabled={!notFoundItems.length || retryBusy}
+              onClick={() => onRetryNotFound({
+                statuses: ["NOT_FOUND"],
+                track_ids: [],
+                search_mode: "balanced",
+                bypass_cache: true,
+                enable_selenium: false,
+                provider_timeout_sec: 8,
+                custom_queries: {},
+              })}
+            >
+              Повторить без кэша
+            </button>
+            <button
+              type="button"
+              className="button"
+              disabled={!notFoundItems.length || retryBusy}
+              onClick={() => onRetryNotFound({
+                statuses: ["NOT_FOUND"],
+                track_ids: [],
+                search_mode: "deep",
+                bypass_cache: true,
+                enable_selenium: true,
+                provider_timeout_sec: 12,
+                custom_queries: {},
+              })}
+            >
+              Повторить глубоким поиском
+            </button>
+          </div>
+        ) : null}
+
+        {activeTab === "manual_review" ? (
+          <div className="problem-toolbar">
+            <button type="button" className="button" onClick={() => setShowList((value) => !value)} disabled={!items.length}>
+              {showList ? "Скрыть список" : "Показать список"}
+            </button>
+            <button
+              type="button"
+              className="button"
+              disabled={!selectedManualTracks.length || manualActionBusy}
+              onClick={() => void handleAcceptSelected()}
+            >
+              Принять выбранные
+            </button>
+            <button
+              type="button"
+              className="button"
+              disabled={!selectedManualTracks.length || manualActionBusy}
+              onClick={() => void handleRejectSelected()}
+            >
+              Отклонить выбранные
+            </button>
+            <button
+              type="button"
+              className="button"
+              disabled={manualActionBusy}
+              onClick={() => void handleRebuildArchive()}
+            >
+              Пересобрать архив
+            </button>
+          </div>
+        ) : null}
+
+        {copyMessage ? <p className="problem-helper">{copyMessage}</p> : null}
+
+        {showList && (activeTab === "not_found" || activeTab === "manual_review") ? (
+          <textarea className="problem-list-textarea" readOnly value={(activeTab === "not_found" ? notFoundListText : listText) || "Список пока пуст."} />
+        ) : null}
+
+        {activeTab === "manual_review" ? (
+          <div className="manual-review-grid">
+            {items.length ? items.map((track, rowIndex) => (
+              <article className="manual-review-card" key={track.track_id || `${track.input_line}-${rowIndex}`}>
+                <div className="manual-review-card-head">
+                  <div>
+                    <p className="card-kicker">Трек #{track.index || rowIndex + 1}</p>
+                    <h3>{track.input_line}</h3>
+                  </div>
+                  <div className="manual-review-card-controls">
+                    <label className="manual-review-checkbox">
+                      <input
+                        type="checkbox"
+                        checked={selectedManualTrackIds.includes(track.track_id)}
+                        onChange={() => toggleManualTrack(track.track_id)}
+                      />
+                      <span>Выбрать</span>
+                    </label>
+                    <span className="count-badge">{track.user_status_label || track.status || "—"}</span>
+                  </div>
+                </div>
+
+                <dl className="manual-review-meta">
+                  <div>
+                    <dt>Ожидалось</dt>
+                    <dd>{track.input_line}</dd>
+                  </div>
+                  <div>
+                    <dt>Найдено</dt>
+                    <dd>{bestCandidateTitle(track)}</dd>
+                  </div>
+                  <div>
+                    <dt>Source</dt>
+                    <dd>{track.best_candidate?.source || track.best_candidate?.provider || "—"}</dd>
+                  </div>
+                  <div>
+                    <dt>Score</dt>
+                    <dd>{typeof track.score === "number" ? track.score.toFixed(2) : "—"}</dd>
+                  </div>
+                  <div>
+                    <dt>Duration</dt>
+                    <dd>{formatDurationSeconds(track.best_candidate?.duration_sec)}</dd>
+                  </div>
+                  <div>
+                    <dt>Flags</dt>
+                    <dd>{track.best_candidate?.version_flags?.length ? track.best_candidate.version_flags.join(", ") : "—"}</dd>
+                  </div>
+                  <div>
+                    <dt>Decision reason</dt>
+                    <dd>{track.decision_reason || track.best_candidate?.decision_reason || "—"}</dd>
+                  </div>
+                </dl>
+
+                {track.provider_summary?.length ? (
+                  <p className="manual-review-note">
+                    {track.provider_summary.map((item) => `${item.provider}: ${item.reason || item.status || item.candidate_count || "—"}`).join(" · ")}
+                  </p>
+                ) : null}
+
+                <div className="manual-review-actions">
+                  <button type="button" className="button" onClick={() => void copyText(track.input_line)}>Скопировать</button>
+                  <button
+                    type="button"
+                    className="button"
+                    disabled={manualActionBusy}
+                    onClick={() => setCandidateTrack(track)}
+                  >
+                    Кандидаты
+                  </button>
+                </div>
+              </article>
+            )) : (
+              <div className="problem-empty">В этой вкладке пока пусто.</div>
+            )}
+          </div>
+        ) : (
+          <div className="problem-table" role="table" aria-label="Проблемные треки">
+            <div className="problem-table-head" role="row">
+              <span>№</span>
+              <span>Ожидаемый трек</span>
+              <span>Статус</span>
+              <span>Причина</span>
+              <span>Лучший кандидат</span>
+              <span>Score</span>
+              <span>Кэш</span>
+              <span>Действия</span>
+            </div>
+            {items.length ? items.map((track, rowIndex) => (
+              <div className="problem-table-row" role="row" key={track.track_id || `${track.input_line}-${rowIndex}`}>
+                <span>{track.index || rowIndex + 1}</span>
+                <div className="problem-primary">
+                  <strong>{track.input_line}</strong>
+                  {track.artist || track.title ? <small>{[track.artist, track.title].filter(Boolean).join(" — ")}</small> : null}
+                </div>
+                <span>{track.user_status_label || track.status || "—"}</span>
+                <div className="problem-reason">
+                  <strong>{problemTrackReason(track)}</strong>
+                  {track.provider_summary?.length ? <small>{track.provider_summary.map((item) => `${item.provider}: ${item.reason || item.status || item.candidate_count || "—"}`).join(" · ")}</small> : null}
+                </div>
+                <span>{bestCandidateTitle(track)}</span>
+                <span>{typeof track.score === "number" ? track.score.toFixed(2) : "—"}</span>
+                <span>{cacheLabel(track.from_cache)}</span>
+                <div className="problem-actions">
+                  <button type="button" className="button" onClick={() => void copyText(track.input_line)}>Скопировать</button>
+                </div>
+              </div>
+            )) : (
+              <div className="problem-empty" role="row">В этой вкладке пока пусто.</div>
+            )}
+          </div>
+        )}
+      </section>
+
+      <CandidateInspectorModal
+        track={candidateTrack}
+        data={candidateData}
+        loading={candidateLoading}
+        error={candidateError}
+        busy={manualActionBusy}
+        onAccept={handleCandidateAccept}
+        onReject={handleCandidateReject}
+        onClose={() => setCandidateTrack(null)}
+      />
+    </>
+  );
+}
+
+function ResultsPanel({
+  job,
+  report,
+  problemTracks,
+  problemTracksLoading,
+  problemTracksError,
+  onRetryNotFound,
+  retryBusy,
+  onManualAccept,
+  onManualReject,
+  onRebuildArchive,
+}: {
+  job: JobInfo | null;
+  report: PlaylistReport | null;
+  problemTracks: ProblemTracksResponse | null;
+  problemTracksLoading: boolean;
+  problemTracksError: string | null;
+  onRetryNotFound: (request: RetryRequest) => void;
+  retryBusy: boolean;
+  onManualAccept: (track: ProblemTrack, candidateId: string) => Promise<void>;
+  onManualReject: (track: ProblemTrack, candidateId: string, reason: string) => Promise<void>;
+  onRebuildArchive: () => Promise<void>;
+}) {
+  const summary = problemTracks?.summary ?? resolveResultSummary(job, report);
+  const ready = job?.download_ready;
+  const archiveLabel = summary.total > 0 && summary.accepted === summary.total ? "Архив готов" : "Архив готов частично";
+
+  return (
+    <>
+      <section className="card results-card" id="results">
+        <div className="card-head">
+          <div>
+            <p className="card-kicker">Итоги</p>
+            <h2>Результаты</h2>
+          </div>
+          {ready ? <span className="ready-badge">{archiveLabel}</span> : null}
+        </div>
+
+        <div className="result-grid">
+          <div><span>Всего</span><strong>{summary.total}</strong></div>
+          <div><span>В архиве</span><strong>{summary.accepted}</strong></div>
+          <div><span>Не найдено</span><strong>{summary.not_found}</strong></div>
+          <div><span>Нужна проверка</span><strong>{summary.manual_review}</strong></div>
+          <div><span>Отклонено</span><strong>{summary.rejected}</strong></div>
+          <div><span>Ошибка скачивания</span><strong>{summary.download_failed}</strong></div>
+        </div>
+
+        {ready && (
+          <div className="download-panel">
+            <strong>{archiveLabel}</strong>
+            <span>В архиве {summary.accepted} из {summary.total}</span>
+            <span>Формат: {job?.download_name?.endsWith(".zip") ? "ZIP" : "архив"}</span>
+            <a className="button primary-gradient link-button" href={`${API_BASE}/api/jobs/${job.job_id}/download`}>
+              Скачать архив
+            </a>
+          </div>
+        )}
+
+        {job?.available_reports && job.available_reports.length > 0 && (
+          <div className="report-actions">
+            {job.available_reports.map((name) => (
+              <a key={name} href={`${API_BASE}/api/jobs/${job.job_id}/reports/${name}`}>
+                Скачать {name}
+              </a>
+            ))}
+          </div>
+        )}
+      </section>
+
+      <ProblemTracksSection
+        job={job}
+        data={problemTracks}
+        loading={problemTracksLoading}
+        error={problemTracksError}
+        onRetryNotFound={onRetryNotFound}
+        retryBusy={retryBusy}
+        onManualAccept={onManualAccept}
+        onManualReject={onManualReject}
+        onRebuildArchive={onRebuildArchive}
+      />
+    </>
+  );
+}
+
 export default function App() {
   const savedPrefs = useMemo(() => readUiPrefs(), []);
   const [limits, setLimits] = useState<Limits | null>(null);
@@ -1598,6 +2432,10 @@ export default function App() {
   const [statusTone, setStatusTone] = useState<NoticeTone>("status");
   const [lastReport, setLastReport] = useState<PlaylistReport | null>(null);
   const [job, setJob] = useState<JobInfo | null>(null);
+  const [problemTracks, setProblemTracks] = useState<ProblemTracksResponse | null>(null);
+  const [problemTracksLoading, setProblemTracksLoading] = useState(false);
+  const [problemTracksError, setProblemTracksError] = useState<string | null>(null);
+  const [retryBusy, setRetryBusy] = useState(false);
   const [downloadedJobId, setDownloadedJobId] = useState<string | null>(null);
   const [importTab, setImportTab] = useState<ImportTab>("text");
   const [importContent, setImportContent] = useState("");
@@ -1617,6 +2455,26 @@ export default function App() {
     rejectRemix: true,
     rejectLive: true,
   });
+
+  const refreshProblemTracksById = useCallback(async (jobId: string) => {
+    setProblemTracksLoading(true);
+    setProblemTracksError(null);
+    try {
+      const res = await fetchApi(`${API_BASE}/api/jobs/${jobId}/problem-tracks`);
+      if (!res.ok) {
+        throw new Error(`Не удалось получить проблемные треки (${res.status})`);
+      }
+      const next = (await res.json()) as ProblemTracksResponse;
+      setProblemTracks(next);
+      return next;
+    } catch (err) {
+      setProblemTracks(null);
+      setProblemTracksError(err instanceof Error ? err.message : "Не удалось загрузить проблемные треки.");
+      throw err;
+    } finally {
+      setProblemTracksLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
     writeUiPrefs(delivery, parallelTasks, speedProfile);
@@ -1753,6 +2611,129 @@ export default function App() {
       setError(null);
     }
   }, [job]);
+
+  useEffect(() => {
+    if (!job?.job_id) {
+      setProblemTracks(null);
+      setProblemTracksError(null);
+      setProblemTracksLoading(false);
+      return;
+    }
+    if (job.status !== "completed" && job.status !== "partial_success" && job.status !== "failed") {
+      setProblemTracks(null);
+      setProblemTracksError(null);
+      setProblemTracksLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    const loadProblemTracks = async () => {
+      try {
+        const next = await refreshProblemTracksById(job.job_id);
+        if (cancelled) return;
+        setProblemTracks(next);
+      } catch (err) {
+        if (cancelled) return;
+      }
+    };
+
+    void loadProblemTracks();
+    return () => {
+      cancelled = true;
+    };
+  }, [job?.job_id, job?.status, refreshProblemTracksById]);
+
+  const retryNotFound = useCallback(async (requestBody: RetryRequest) => {
+    if (!job?.job_id) return;
+    setRetryBusy(true);
+    setError(null);
+    setStatus(null);
+    try {
+      const res = await fetchApi(`${API_BASE}/api/jobs/${job.job_id}/retry`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(requestBody),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.detail || `Не удалось запустить retry (${res.status})`);
+      }
+      setProblemTracks(null);
+      setProblemTracksError(null);
+      setLastReport(null);
+      setDownloadedJobId(null);
+      setJob(data as JobInfo);
+      setStatus("Retry запущен только для не найденных треков.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Не удалось запустить retry.");
+    } finally {
+      setRetryBusy(false);
+    }
+  }, [job?.job_id]);
+
+  const manualAccept = useCallback(async (track: ProblemTrack, candidateId: string) => {
+    if (!job?.job_id) return;
+    setError(null);
+    setStatus(null);
+    const res = await fetchApi(`${API_BASE}/api/jobs/${job.job_id}/manual-accept`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ track_id: track.track_id, candidate_id: candidateId }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data?.detail || `Не удалось принять кандидата (${res.status})`);
+    }
+    setDownloadedJobId(null);
+    const nextJob = data as JobInfo;
+    setJob(nextJob);
+    if (nextJob.report) setLastReport(nextJob.report);
+    await refreshProblemTracksById(nextJob.job_id);
+    setStatus("Ручное принятие сохранено. Архив нужно пересобрать.");
+    setStatusTone("status");
+  }, [job?.job_id, refreshProblemTracksById]);
+
+  const manualReject = useCallback(async (track: ProblemTrack, candidateId: string, reason: string) => {
+    if (!job?.job_id) return;
+    setError(null);
+    setStatus(null);
+    const res = await fetchApi(`${API_BASE}/api/jobs/${job.job_id}/manual-reject`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ track_id: track.track_id, candidate_id: candidateId, reason }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data?.detail || `Не удалось отклонить кандидата (${res.status})`);
+    }
+    setDownloadedJobId(null);
+    const nextJob = data as JobInfo;
+    setJob(nextJob);
+    if (nextJob.report) setLastReport(nextJob.report);
+    await refreshProblemTracksById(nextJob.job_id);
+    setStatus("Ручное отклонение сохранено. Архив можно пересобрать при необходимости.");
+    setStatusTone("status");
+  }, [job?.job_id, refreshProblemTracksById]);
+
+  const rebuildArchive = useCallback(async () => {
+    if (!job?.job_id) return;
+    setError(null);
+    setStatus(null);
+    const res = await fetchApi(`${API_BASE}/api/jobs/${job.job_id}/rebuild-archive`, {
+      method: "POST",
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data?.detail || `Не удалось пересобрать архив (${res.status})`);
+    }
+    const nextJob = data as JobInfo;
+    setDownloadedJobId(null);
+    setJob(nextJob);
+    if (nextJob.report) setLastReport(nextJob.report);
+    await refreshProblemTracksById(nextJob.job_id);
+    setStatus("Архив пересобран и готов к скачиванию.");
+    setStatusTone("status");
+  }, [job?.job_id, refreshProblemTracksById]);
 
   const importAnalysis = useMemo(
     () => detectImportAnalysis(importTab, importContent, importFile),
@@ -1906,7 +2887,18 @@ export default function App() {
         </section>
 
         <section className="results-grid">
-          <ResultsCard job={job} report={lastReport} />
+          <ResultsPanel
+            job={job}
+            report={lastReport}
+            problemTracks={problemTracks}
+            problemTracksLoading={problemTracksLoading}
+            problemTracksError={problemTracksError}
+            onRetryNotFound={retryNotFound}
+            retryBusy={retryBusy}
+            onManualAccept={manualAccept}
+            onManualReject={manualReject}
+            onRebuildArchive={rebuildArchive}
+          />
           <section className="card help-card" id="help">
             <p className="card-kicker">Важно</p>
             <h2>Как подготовить плейлист</h2>

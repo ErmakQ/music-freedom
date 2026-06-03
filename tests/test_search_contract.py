@@ -24,6 +24,17 @@ def track_query(raw: str = "Artist - Song") -> TrackQuery:
         title="Song",
         generated_queries=[raw],
         requested_flags=[],
+        cache_context={
+            "search_mode": "balanced",
+            "enabled_providers": ["hitmo:http", "lmusic:http", "zvyki:http"],
+            "enable_selenium_fallback": False,
+            "provider_origins": {
+                "hitmo": "https://eu.hitmoz.com",
+                "lmusic": "https://lmusic.kz",
+                "zvyki": "https://zvyki.com",
+            },
+            "search_logic_version": "search-v2",
+        },
     )
 
 
@@ -149,6 +160,19 @@ class SearchLayerContractTests(unittest.TestCase):
             os.environ.clear()
             os.environ.update(old)
 
+    def test_negative_cache_env_defaults_load(self) -> None:
+        old = os.environ.copy()
+        try:
+            os.environ.pop("NEGATIVE_CACHE_TTL_HOURS", None)
+            os.environ.pop("BYPASS_NEGATIVE_CACHE_FOR_DEEP", None)
+            cfg = load_download_config_from_env()
+        finally:
+            os.environ.clear()
+            os.environ.update(old)
+
+        self.assertEqual(cfg.negative_cache_ttl_hours, 12)
+        self.assertTrue(cfg.bypass_negative_cache_for_deep)
+
     def test_cache_hit_skips_providers(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             cache = SearchCache(Path(td) / "search.sqlite3", enabled=True)
@@ -250,6 +274,9 @@ class SearchLayerContractTests(unittest.TestCase):
         self.assertIn("decision_reason", report)
         self.assertIn("provider_results", report)
         self.assertIn("from_cache", report)
+        self.assertIn("cache_key", report)
+        self.assertIn("cache_hit_type", report)
+        self.assertIn("skipped_selenium_reason", report)
         self.assertIn("decision_reason", report["candidates"][0])
 
     def test_playlist_duration_is_preserved_for_validation(self) -> None:

@@ -29,10 +29,12 @@ class SearchOrchestrator:
         self.enable_selenium_fallback = enable_selenium_fallback
 
     async def search(self, track: TrackQuery) -> SearchDecision:
-        cached = self.cache.get(track) if self.cache else None
-        if cached:
-            decision = self._decision_from_cached(track, cached)
+        cache_entry = self.cache.get_entry(track) if self.cache else None
+        if cache_entry:
+            decision = self._decision_from_cached(track, cache_entry["payload"])
             decision.from_cache = True
+            decision.cache_key = cache_entry.get("cache_key")
+            decision.cache_hit_type = cache_entry.get("cache_hit_type")
             return decision
 
         http_results = await self._run_http_providers(track)
@@ -48,6 +50,7 @@ class SearchOrchestrator:
 
         if self._can_early_stop(decision):
             decision.decision_reason = "early_stop_http_high_confidence"
+            decision.skipped_selenium_reason = "enough_http_candidates"
             if self.cache:
                 self.cache.put(decision)
             return decision
@@ -68,11 +71,21 @@ class SearchOrchestrator:
                 all_results,
                 decision_reason="http_plus_selenium_fallback",
             )
+            decision.skipped_selenium_reason = None
+        elif self.selenium_provider is None and self.enable_selenium_fallback:
+            decision.skipped_selenium_reason = "selenium_provider_unavailable"
+            if decision.reason == quality_layer.STATUS_NOT_FOUND:
+                decision.decision_reason = "http_only_not_found_selenium_unavailable"
+            else:
+                decision.decision_reason = "http_only_selenium_unavailable"
         elif not self.enable_selenium_fallback:
+            decision.skipped_selenium_reason = "selenium_disabled"
             if decision.reason == quality_layer.STATUS_NOT_FOUND:
                 decision.decision_reason = "http_only_not_found_selenium_disabled"
             else:
                 decision.decision_reason = "http_only_selenium_disabled"
+        else:
+            decision.skipped_selenium_reason = "enough_http_candidates"
 
         if self.cache:
             self.cache.put(decision)
@@ -226,4 +239,6 @@ class SearchOrchestrator:
                 )
             ],
             from_cache=True,
+            cache_hit_type="negative" if status else "positive",
+            skipped_selenium_reason=payload.get("skipped_selenium_reason"),
         )

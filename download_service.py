@@ -64,6 +64,11 @@ def load_download_config_from_env() -> DownloadConfig:
         "no",
     )
     search_cache_ttl = int(os.environ.get("SEARCH_CACHE_TTL_DAYS", "14"))
+    negative_cache_ttl_hours = int(os.environ.get("NEGATIVE_CACHE_TTL_HOURS", "12"))
+    bypass_negative_cache_for_deep = os.environ.get(
+        "BYPASS_NEGATIVE_CACHE_FOR_DEEP",
+        "true",
+    ).strip().lower() not in ("0", "false", "no")
     http_search_concurrency = max(1, min(100, int(os.environ.get("HTTP_SEARCH_CONCURRENCY", "30"))))
     download_concurrency = max(1, min(32, int(os.environ.get("DOWNLOAD_CONCURRENCY", str(parallel_dl)))))
     validation_concurrency = max(1, min(32, int(os.environ.get("VALIDATION_CONCURRENCY", "4"))))
@@ -101,6 +106,8 @@ def load_download_config_from_env() -> DownloadConfig:
         enable_selenium_fallback=enable_selenium,
         search_cache_enabled=search_cache_enabled,
         search_cache_ttl_days=search_cache_ttl,
+        negative_cache_ttl_hours=negative_cache_ttl_hours,
+        bypass_negative_cache_for_deep=bypass_negative_cache_for_deep,
         search_cache_path=cache_path,
         lmusic_fallback_enabled=lmusic_fallback,
         zvyki_fallback_enabled=zvyki_fallback,

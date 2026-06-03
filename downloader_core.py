@@ -395,6 +395,8 @@ class DownloadConfig:
     enable_selenium_fallback: bool = False
     search_cache_enabled: bool = True
     search_cache_ttl_days: int = 14
+    negative_cache_ttl_hours: int = 12
+    bypass_negative_cache_for_deep: bool = True
     search_cache_path: str = ""
     # Fallback-поиск на lmusic.kz для треков, которые не нашлись на основном сайте.
     lmusic_fallback_enabled: bool = True
@@ -507,10 +509,12 @@ def candidate_download_urls(download_url: str, site_origin: str) -> list[str]:
 
 def parse_artist_title(raw: str) -> tuple[str, str]:
     if " - " in raw:
-        artist, title = raw.rsplit(" - ", 1)
+        artist, title = raw.split(" - ", 1)
         return artist.strip(), title.strip()
-    parts = raw.split("-")
-    return parts[0].strip(), parts[-1].strip()
+    if "-" in raw:
+        artist, title = raw.split("-", 1)
+        return artist.strip(), title.strip()
+    return raw.strip(), raw.strip()
 
 
 def build_search_query(raw: str) -> str:
@@ -1242,6 +1246,9 @@ def _candidate_report_entry(
     decision_reason: str | None = None,
     provider_results: list | None = None,
     from_cache: bool = False,
+    cache_key: str | None = None,
+    cache_hit_type: str | None = None,
+    skipped_selenium_reason: str | None = None,
 ) -> dict:
     candidate_dicts = []
     for candidate in candidates:
@@ -1256,6 +1263,9 @@ def _candidate_report_entry(
         "generated_queries": generated_queries,
         "decision_reason": decision_reason,
         "from_cache": from_cache,
+        "cache_key": cache_key,
+        "cache_hit_type": cache_hit_type,
+        "skipped_selenium_reason": skipped_selenium_reason,
         "provider_results": [
             {
                 "provider": getattr(result, "provider", ""),
@@ -1285,11 +1295,18 @@ def _resolve_quality_plan(
         TrackQuery,
         ZvykiHTTPProvider,
     )
-    from search.cache import SearchCache
+    from search.cache import SEARCH_LOGIC_VERSION, SearchCache
 
     artist, title = parse_artist_title(raw_song_query)
     requested_flags = sorted(quality_layer.detect_requested_version_flags(raw_song_query))
     generated_queries = search_query_variants(cfg, raw_song_query)
+    enabled_providers = ["hitmo:http"]
+    if cfg.lmusic_fallback_enabled:
+        enabled_providers.append("lmusic:http")
+    if cfg.zvyki_fallback_enabled:
+        enabled_providers.append("zvyki:http")
+    if cfg.enable_selenium_fallback:
+        enabled_providers.append("selenium:fallback")
     track = TrackQuery(
         raw=raw_song_query,
         artist=artist,
@@ -1297,11 +1314,24 @@ def _resolve_quality_plan(
         expected_duration_sec=expected_duration_sec,
         generated_queries=generated_queries,
         requested_flags=requested_flags,
+        cache_context={
+            "search_mode": cfg.search_mode,
+            "enabled_providers": enabled_providers,
+            "enable_selenium_fallback": cfg.enable_selenium_fallback,
+            "provider_origins": {
+                "hitmo": cfg.site_origin,
+                "lmusic": cfg.lmusic_origin,
+                "zvyki": cfg.zvyki_origin,
+            },
+            "search_logic_version": SEARCH_LOGIC_VERSION,
+        },
     )
     cache_path = cfg.search_cache_path or str(Path("downloaded_music") / "search_cache.sqlite3")
     cache = SearchCache(
         cache_path,
         ttl_days=cfg.search_cache_ttl_days,
+        negative_ttl_hours=cfg.negative_cache_ttl_hours,
+        bypass_negative_cache_for_deep=cfg.bypass_negative_cache_for_deep,
         enabled=cfg.search_cache_enabled,
     )
     selenium_provider = None
@@ -1338,6 +1368,9 @@ def _resolve_quality_plan(
         "decision_reason": decision.decision_reason,
         "provider_results": decision.provider_results,
         "from_cache": decision.from_cache,
+        "cache_key": getattr(decision, "cache_key", None),
+        "cache_hit_type": getattr(decision, "cache_hit_type", None),
+        "skipped_selenium_reason": getattr(decision, "skipped_selenium_reason", None),
     }
 
 
@@ -2160,6 +2193,9 @@ def run_playlist_download(
                         resolved_info.get("decision_reason"),
                         resolved_info.get("provider_results"),
                         bool(resolved_info.get("from_cache")),
+                        resolved_info.get("cache_key"),
+                        resolved_info.get("cache_hit_type"),
+                        resolved_info.get("skipped_selenium_reason"),
                     )
                 )
                 if not resolved_info["download_candidates"]:
@@ -2263,6 +2299,9 @@ def run_playlist_download(
                     resolved_info.get("decision_reason"),
                     resolved_info.get("provider_results"),
                     bool(resolved_info.get("from_cache")),
+                    resolved_info.get("cache_key"),
+                    resolved_info.get("cache_hit_type"),
+                    resolved_info.get("skipped_selenium_reason"),
                 )
             )
             if not resolved_info["download_candidates"]:

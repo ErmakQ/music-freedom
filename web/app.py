@@ -11,12 +11,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import copy
+import hashlib
 import json
 import logging
 import os
 import shutil
 import tempfile
 import threading
+import urllib.parse
 import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -27,17 +29,18 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 from starlette.middleware.sessions import SessionMiddleware
 
 from download_service import load_download_config_from_env
-from downloader_core import run_playlist_download
+from downloader_core import DownloadConfig, _download_quality_candidate, parse_artist_title, run_playlist_download
 from playlist_utils import decode_playlist_bytes, effective_max_playlist_lines, normalize_playlist_line
 import quality as quality_layer
 from playlist_importers import import_playlist as import_playlist_content
 from playlist_importers import save_imported_playlist
+from playlist_importers.preview_diagnostics import analyze_preview_tracks
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(_PROJECT_ROOT / ".env")
@@ -189,6 +192,37 @@ def _build_run_settings(speed_profile: str, parallel_tasks: str | None) -> dict:
     return settings
 
 
+def _normalize_retry_run_settings(
+    base_run_settings: dict | None,
+    payload: dict | None,
+) -> dict:
+    run_settings = dict(base_run_settings or {"speed_profile": "env", "parallel_tasks": "auto"})
+    payload = payload or {}
+
+    search_mode = str(payload.get("search_mode") or "").strip().lower()
+    if search_mode in {"fast", "balanced", "deep"}:
+        run_settings["search_mode"] = search_mode
+
+    if "bypass_cache" in payload:
+        run_settings["bypass_cache"] = bool(payload.get("bypass_cache"))
+
+    if "enable_selenium" in payload:
+        run_settings["enable_selenium"] = bool(payload.get("enable_selenium"))
+
+    provider_timeout = payload.get("provider_timeout_sec")
+    if provider_timeout not in (None, ""):
+        try:
+            run_settings["provider_timeout_sec"] = float(provider_timeout)
+        except (TypeError, ValueError):
+            pass
+
+    custom_queries = payload.get("custom_queries")
+    if isinstance(custom_queries, dict):
+        run_settings["custom_queries"] = custom_queries
+
+    return run_settings
+
+
 def _apply_run_settings(cfg, run_settings: dict | None):
     if not run_settings:
         return cfg
@@ -210,6 +244,22 @@ def _apply_run_settings(cfg, run_settings: dict | None):
     if parallel in {"3", "5", "10"}:
         cfg.download_concurrency = max(1, min(16, int(parallel)))
         cfg.parallel_download_workers = cfg.download_concurrency
+    search_mode = str(run_settings.get("search_mode") or "").lower()
+    if search_mode in {"fast", "balanced", "deep"}:
+        cfg.search_mode = search_mode
+    if bool(run_settings.get("bypass_cache")):
+        cfg.search_cache_enabled = False
+    if "enable_selenium" in run_settings:
+        cfg.enable_selenium_fallback = bool(run_settings.get("enable_selenium"))
+    provider_timeout = run_settings.get("provider_timeout_sec")
+    if provider_timeout not in (None, ""):
+        try:
+            cfg.provider_timeout_sec = float(provider_timeout)
+            cfg.http_search_timeout = float(provider_timeout)
+        except (TypeError, ValueError):
+            pass
+    if cfg.search_mode == "deep":
+        cfg.enable_selenium_fallback = True
     return cfg
 
 
@@ -261,6 +311,7 @@ def _playlist_report_dict(result: dict) -> dict:
     skipped = result.get("skipped") or []
     ok = result.get("ok") or []
     quality_counts = result.get("quality_counts") or {}
+    result_summary = _normalized_result_summary(result.get("quality_items") or [], total=len(ok) + len(failed) + len(skipped))
     cap = _REPORT_LIST_CAP
     return {
         "counts": {
@@ -269,6 +320,7 @@ def _playlist_report_dict(result: dict) -> dict:
             "skipped": len(skipped),
         },
         "quality_counts": quality_counts,
+        "result_summary": result_summary,
         "failed": failed[:cap],
         "failed_truncated": len(failed) > cap,
         "skipped": skipped[:cap],
@@ -299,6 +351,7 @@ def _job_update(app: FastAPI, job_id: str, **changes) -> None:
 def _public_job(job: dict) -> dict:
     return {
         "job_id": job["job_id"],
+        "parent_job_id": job.get("parent_job_id"),
         "status": job["status"],
         "phase": job["phase"],
         "detail": job.get("detail"),
@@ -311,6 +364,7 @@ def _public_job(job: dict) -> dict:
         "current_track": job.get("current_track"),
         "counts": job.get("counts"),
         "quality_counts": job.get("quality_counts"),
+        "result_summary": job.get("result_summary"),
         "report": job.get("report"),
         "available_reports": job.get("available_reports") or [],
         "download_ready": job.get("download_ready", False),
@@ -333,6 +387,87 @@ def _zero_quality_counts() -> dict:
         "suspicious": 0,
         "manual_review": 0,
     }
+
+
+def _zero_result_summary(total: int = 0) -> dict:
+    return {
+        "total": int(total or 0),
+        "accepted": 0,
+        "not_found": 0,
+        "manual_review": 0,
+        "rejected": 0,
+        "download_failed": 0,
+        "suspicious": 0,
+    }
+
+
+def _status_problem_group(status: str | None) -> str | None:
+    status = str(status or "")
+    if not status or status in {quality_layer.STATUS_OK, "MANUALLY_ACCEPTED"}:
+        return None
+    if status == "MANUALLY_REJECTED":
+        return "rejected"
+    if status == quality_layer.STATUS_NOT_FOUND:
+        return "not_found"
+    if status == quality_layer.STATUS_DOWNLOAD_FAILED:
+        return "download_failed"
+    if status == quality_layer.STATUS_SUSPICIOUS_FILE:
+        return "suspicious"
+    if status.startswith("REJECTED_"):
+        return "rejected"
+    return "manual_review"
+
+
+def _user_status_label(status: str | None) -> str:
+    status = str(status or "")
+    labels = {
+        quality_layer.STATUS_OK: "В архиве",
+        "MANUALLY_ACCEPTED": "Принято вручную",
+        "MANUALLY_REJECTED": "Отклонено вручную",
+        quality_layer.STATUS_NOT_FOUND: "Не найдено",
+        quality_layer.STATUS_DOWNLOAD_FAILED: "Ошибка скачивания",
+        quality_layer.STATUS_LOW_CONFIDENCE_MATCH: "Нужна проверка",
+        quality_layer.STATUS_VERSION_MISMATCH: "Нужна проверка",
+        quality_layer.STATUS_DURATION_MISMATCH: "Нужна проверка",
+        quality_layer.STATUS_SUSPICIOUS_FILE: "Подозрительный файл",
+        quality_layer.STATUS_NEEDS_MANUAL_REVIEW: "Нужна проверка",
+    }
+    if status.startswith("REJECTED_"):
+        return "Отклонено фильтром"
+    return labels.get(status, "Нужна проверка" if status else "")
+
+
+def _normalized_result_summary(items: list[dict], total: int | None = None) -> dict:
+    summary = _zero_result_summary(total if total is not None else len(items))
+    if total is None:
+        summary["total"] = len(items)
+    for item in items:
+        status = str(item.get("status") or "")
+        if status == quality_layer.STATUS_OK:
+            summary["accepted"] += 1
+        if status in quality_layer.MANUAL_REVIEW_STATUSES:
+            summary["manual_review"] += 1
+        group = _status_problem_group(status)
+        if group and group != "manual_review":
+            summary[group] += 1
+    return summary
+
+
+def _normalized_result_summary_from_counts(job: dict) -> dict:
+    total = int(job.get("total_lines") or 0)
+    counts = job.get("counts") or {}
+    quality_counts = job.get("quality_counts") or {}
+    summary = _zero_result_summary(total)
+    summary["accepted"] = int(quality_counts.get("downloaded_ok") or counts.get("ok") or 0)
+    summary["not_found"] = int(quality_counts.get("not_found") or 0)
+    summary["manual_review"] = int(quality_counts.get("manual_review") or 0)
+    summary["rejected"] = (
+        int(quality_counts.get("rejected_clean_or_censored") or 0)
+        + int(quality_counts.get("rejected_radio") or 0)
+    )
+    summary["download_failed"] = int(quality_counts.get("download_failed") or 0)
+    summary["suspicious"] = int(quality_counts.get("suspicious") or 0)
+    return summary
 
 
 def _bump_quality_count(counts: dict, status: str) -> None:
@@ -368,6 +503,7 @@ _REPORT_DOWNLOAD_NAMES = {
     "quality_report.csv": "quality_report.csv",
     "manual_review.csv": "manual_review.csv",
     "candidates.json": "candidates.json",
+    "manual_decisions.json": "manual_decisions.json",
 }
 
 _IMPORT_DOWNLOAD_NAMES = {
@@ -385,16 +521,508 @@ def _available_report_names_for_root(root: str | None) -> list[str]:
     return [name for name in _REPORT_DOWNLOAD_NAMES if (p / name).is_file()]
 
 
+def _read_json_file(path: Path) -> dict | list | None:
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        log.warning("Could not read json report: %s", path, exc_info=True)
+        return None
+
+
+def _write_json_file(path: Path, payload: dict | list) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _manual_decisions_path(root: str | None) -> Path | None:
+    if not root:
+        return None
+    return Path(root) / "manual_decisions.json"
+
+
+def _read_manual_decisions(root: str | None) -> dict[str, dict]:
+    path = _manual_decisions_path(root)
+    if path is None:
+        return {}
+    payload = _read_json_file(path)
+    if isinstance(payload, dict):
+        decisions = payload.get("decisions")
+        if isinstance(decisions, dict):
+            return {
+                str(track_id): value
+                for track_id, value in decisions.items()
+                if isinstance(value, dict)
+            }
+    return {}
+
+
+def _write_manual_decisions(root: str | None, decisions: dict[str, dict]) -> None:
+    path = _manual_decisions_path(root)
+    if path is None:
+        return
+    _write_json_file(path, {"decisions": decisions})
+
+
+def _candidate_lookup(candidates_report: list) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for entry in candidates_report:
+        if isinstance(entry, dict):
+            key = str(entry.get("input_track") or "")
+            if key:
+                out[key] = entry
+    return out
+
+
+def _track_id(index: int, input_line: str) -> str:
+    digest = hashlib.sha1(f"{index}:{input_line}".encode("utf-8", errors="replace")).hexdigest()[:12]
+    return f"track_{index}_{digest}"
+
+
+def _candidate_id(track_id: str, candidate_index: int, candidate: dict) -> str:
+    base = str(candidate.get("download_url") or candidate.get("source_url") or candidate.get("raw_display_title") or "")
+    digest = hashlib.sha1(f"{track_id}:{candidate_index}:{base}".encode("utf-8", errors="replace")).hexdigest()[:10]
+    return f"{track_id}_cand_{candidate_index}_{digest}"
+
+
+def _candidate_status(candidate: dict) -> str:
+    if candidate.get("hard_reject"):
+        return str(candidate.get("reject_reason") or "REJECTED")
+    score = candidate.get("score")
+    try:
+        score_value = float(score)
+    except (TypeError, ValueError):
+        score_value = None
+    if score_value is not None and score_value >= quality_layer.LOW_CONFIDENCE_THRESHOLD:
+        return "MATCH"
+    return "CANDIDATE"
+
+
+def _quality_candidate_from_dict(candidate: dict, input_track: str) -> quality_layer.TrackCandidate:
+    quality_candidate = quality_layer.TrackCandidate(
+        provider=str(candidate.get("provider") or "manual"),
+        input_track=input_track,
+        raw_artist=candidate.get("raw_artist"),
+        raw_title=candidate.get("raw_title"),
+        raw_display_title=str(candidate.get("raw_display_title") or candidate.get("raw_title") or ""),
+        normalized_artist=candidate.get("normalized_artist"),
+        normalized_title=candidate.get("normalized_title"),
+        normalized_display_title=str(candidate.get("normalized_display_title") or ""),
+        source_url=candidate.get("source_url"),
+        download_url=candidate.get("download_url"),
+        referer=candidate.get("referer"),
+        cookie_header=str(candidate.get("cookie_header") or ""),
+        search_query=candidate.get("search_query"),
+        duration_sec=candidate.get("duration_sec"),
+        file_size=candidate.get("file_size"),
+        bitrate=candidate.get("bitrate"),
+        score=float(candidate.get("score") or 0.0),
+        flags=list(candidate.get("flags") or []),
+        hard_reject=bool(candidate.get("hard_reject")),
+        reject_reason=candidate.get("reject_reason"),
+    )
+    decision_reason = candidate.get("decision_reason")
+    if decision_reason:
+        setattr(quality_candidate, "decision_reason", decision_reason)
+    return quality_candidate
+
+
+def _normalized_candidate_payload(
+    track_id: str,
+    candidate: dict | None,
+    *,
+    candidate_index: int = 1,
+    can_accept: bool = False,
+) -> dict | None:
+    if not isinstance(candidate, dict):
+        return None
+    flags = candidate.get("flags")
+    return {
+        "candidate_id": _candidate_id(track_id, candidate_index, candidate),
+        "title": candidate.get("raw_title") or candidate.get("raw_display_title"),
+        "artist": candidate.get("raw_artist"),
+        "display_title": candidate.get("raw_display_title") or candidate.get("raw_title"),
+        "provider": candidate.get("provider"),
+        "source": candidate.get("provider"),
+        "score": candidate.get("score"),
+        "duration_sec": candidate.get("duration_sec"),
+        "version_flags": flags if isinstance(flags, list) else [],
+        "status": _candidate_status(candidate),
+        "reject_reason": candidate.get("reject_reason"),
+        "decision_reason": candidate.get("decision_reason"),
+        "downloaded_path": None,
+        "can_preview": False,
+        "can_accept": can_accept,
+    }
+
+
+def _best_candidate_payload(track_id: str, item: dict, candidate_entry: dict | None) -> dict | None:
+    selected = item.get("selected_candidate") if isinstance(item.get("selected_candidate"), dict) else None
+    normalized_selected = _normalized_candidate_payload(track_id, selected, candidate_index=1)
+    if normalized_selected:
+        return normalized_selected
+    if candidate_entry:
+        candidates = candidate_entry.get("candidates")
+        if isinstance(candidates, list) and candidates and isinstance(candidates[0], dict):
+            return _normalized_candidate_payload(track_id, candidates[0], candidate_index=1)
+    return None
+
+
+def _problem_track_candidates(track_id: str, candidate_entry: dict | None) -> list[dict]:
+    if not isinstance(candidate_entry, dict):
+        return []
+    raw_candidates = candidate_entry.get("candidates")
+    if not isinstance(raw_candidates, list):
+        return []
+    out: list[dict] = []
+    for idx, candidate in enumerate(raw_candidates, 1):
+        payload = _normalized_candidate_payload(track_id, candidate, candidate_index=idx)
+        if payload:
+            out.append(payload)
+    return out
+
+
+def _problem_track_candidates_with_raw(
+    track_id: str,
+    item: dict | None,
+    candidate_entry: dict | None,
+) -> list[tuple[dict, dict]]:
+    out: list[tuple[dict, dict]] = []
+    raw_candidates = candidate_entry.get("candidates") if isinstance(candidate_entry, dict) else None
+    if isinstance(raw_candidates, list):
+        for idx, candidate in enumerate(raw_candidates, 1):
+            if not isinstance(candidate, dict):
+                continue
+            payload = _normalized_candidate_payload(track_id, candidate, candidate_index=idx, can_accept=True)
+            if payload:
+                out.append((payload, candidate))
+    if out:
+        return out
+    selected = item.get("selected_candidate") if isinstance(item, dict) and isinstance(item.get("selected_candidate"), dict) else None
+    payload = _normalized_candidate_payload(track_id, selected, candidate_index=1, can_accept=True)
+    if payload and isinstance(selected, dict):
+        out.append((payload, selected))
+    return out
+
+
+def _problem_track_payload(index: int, item: dict, candidate_entry: dict | None = None) -> dict:
+    input_line = str(item.get("input_track") or "")
+    artist, title = parse_artist_title(input_line)
+    track_id = _track_id(index, input_line)
+    best_candidate = _best_candidate_payload(track_id, item, candidate_entry)
+    decision_reason = None
+    from_cache = None
+    provider_summary = []
+    if candidate_entry:
+        decision_reason = candidate_entry.get("decision_reason")
+        from_cache = candidate_entry.get("from_cache")
+        provider_results = candidate_entry.get("provider_results")
+        if isinstance(provider_results, list):
+            provider_summary = provider_results
+    if not decision_reason and isinstance(best_candidate, dict):
+        decision_reason = best_candidate.get("decision_reason")
+    return {
+        "track_id": track_id,
+        "index": index,
+        "input_line": input_line,
+        "artist": artist or None,
+        "title": title or None,
+        "status": item.get("status"),
+        "user_status_label": _user_status_label(item.get("status")),
+        "reason": item.get("reason"),
+        "decision_reason": decision_reason,
+        "best_candidate": best_candidate,
+        "score": best_candidate.get("score") if isinstance(best_candidate, dict) else None,
+        "from_cache": from_cache,
+        "provider_summary": provider_summary,
+    }
+
+
+def _empty_problem_groups() -> dict[str, list]:
+    return {
+        "not_found": [],
+        "manual_review": [],
+        "rejected": [],
+        "download_failed": [],
+        "suspicious": [],
+    }
+
+
+def _problem_track_records_from_reports(root: str | None) -> tuple[dict | None, dict[str, list], dict[str, dict]]:
+    if not root:
+        return None, _empty_problem_groups(), {}
+    root_path = Path(root)
+    report_data = _read_json_file(root_path / "quality_report.json")
+    candidates_data = _read_json_file(root_path / "candidates.json")
+    if not isinstance(report_data, dict):
+        return None, _empty_problem_groups(), {}
+    items = report_data.get("items")
+    if not isinstance(items, list):
+        return None, _empty_problem_groups(), {}
+    candidates_lookup = _candidate_lookup(candidates_data if isinstance(candidates_data, list) else [])
+    report_summary = report_data.get("summary") if isinstance(report_data.get("summary"), dict) else {}
+    summary = _normalized_result_summary(
+        [item for item in items if isinstance(item, dict)],
+        total=report_summary.get("total"),
+    )
+    groups = _empty_problem_groups()
+    records: dict[str, dict] = {}
+    for index, item in enumerate(items, 1):
+        if not isinstance(item, dict):
+            continue
+        group = _status_problem_group(item.get("status"))
+        if not group:
+            continue
+        candidate_entry = candidates_lookup.get(str(item.get("input_track") or ""))
+        payload = _problem_track_payload(index, item, candidate_entry)
+        groups[group].append(payload)
+        records[payload["track_id"]] = {
+            "group": group,
+            "track": payload,
+            "item": item,
+            "candidate_entry": candidate_entry,
+        }
+    decisions = _read_manual_decisions(root)
+    if decisions:
+        summary = dict(summary or _zero_result_summary())
+        for track_id, decision in decisions.items():
+            record = records.get(track_id)
+            if record is None:
+                continue
+            original_group = str(record.get("group") or "")
+            track_payload = record.get("track") if isinstance(record.get("track"), dict) else None
+            if track_payload is None:
+                continue
+            if original_group in groups:
+                groups[original_group] = [item for item in groups[original_group] if str(item.get("track_id") or "") != track_id]
+            original_status = str(track_payload.get("status") or "")
+            if original_status in quality_layer.MANUAL_REVIEW_STATUSES:
+                summary["manual_review"] = max(0, int(summary.get("manual_review") or 0) - 1)
+
+            action = str(decision.get("action") or "")
+            if action == "accept":
+                summary["accepted"] = int(summary.get("accepted") or 0) + 1
+                continue
+
+            if action == "reject":
+                summary["rejected"] = int(summary.get("rejected") or 0) + 1
+                updated_track = dict(track_payload)
+                updated_track["status"] = "MANUALLY_REJECTED"
+                updated_track["user_status_label"] = "Отклонено вручную"
+                updated_track["reason"] = decision.get("reason") or "manual reject"
+                updated_track["decision_reason"] = decision.get("reason") or track_payload.get("decision_reason")
+                candidate_payload = decision.get("candidate")
+                if isinstance(candidate_payload, dict):
+                    updated_track["best_candidate"] = candidate_payload
+                    updated_track["score"] = candidate_payload.get("score")
+                groups["rejected"].append(updated_track)
+                record["track"] = updated_track
+                record["group"] = "rejected"
+                record["decision"] = decision
+    return summary, groups, records
+
+
+def _problem_tracks_from_reports(root: str | None) -> tuple[dict | None, dict[str, list]]:
+    summary, groups, _records = _problem_track_records_from_reports(root)
+    return summary, groups
+
+
+def _problem_tracks_fallback(job: dict) -> tuple[dict, dict[str, list]]:
+    summary = job.get("result_summary")
+    if not isinstance(summary, dict):
+        summary = _normalized_result_summary_from_counts(job)
+    groups = _empty_problem_groups()
+    report = job.get("report") if isinstance(job.get("report"), dict) else {}
+    failed = report.get("failed") if isinstance(report, dict) else []
+    if isinstance(failed, list):
+        for index, line in enumerate(failed, 1):
+            item = {
+                "input_track": str(line),
+                "status": quality_layer.STATUS_NEEDS_MANUAL_REVIEW,
+                "reason": None,
+            }
+            groups["manual_review"].append(_problem_track_payload(index, item, None))
+    return summary, groups
+
+
+def _not_found_lines(root: str | None, job: dict) -> list[str]:
+    _summary, groups = _problem_tracks_from_reports(root)
+    if groups.get("not_found"):
+        return [
+            str(item.get("input_line") or "").strip()
+            for item in groups["not_found"]
+            if str(item.get("input_line") or "").strip()
+        ]
+
+    report = job.get("report") if isinstance(job.get("report"), dict) else {}
+    failed = report.get("failed") if isinstance(report, dict) else []
+    if not isinstance(failed, list):
+        return []
+    return [str(line).strip() for line in failed if str(line).strip()]
+
+
+def _problem_tracks_payload_for_job(job: dict) -> tuple[dict, dict[str, list]]:
+    root = str(job.get("saved_run") or job.get("work_root") or "")
+    summary, groups = _problem_tracks_from_reports(root)
+    if summary is None:
+        summary, groups = _problem_tracks_fallback(job)
+    return summary, groups
+
+
+def _problem_track_record_for_job(job: dict, track_id: str) -> dict | None:
+    root = str(job.get("saved_run") or job.get("work_root") or "")
+    _summary, _groups, records = _problem_track_records_from_reports(root)
+    record = records.get(track_id)
+    if record is not None:
+        return record
+
+    fallback_summary, fallback_groups = _problem_tracks_fallback(job)
+    for group_name, items in fallback_groups.items():
+        for payload in items:
+            if str(payload.get("track_id") or "") == track_id:
+                return {
+                    "group": group_name,
+                    "track": payload,
+                    "item": {
+                        "input_track": payload.get("input_line"),
+                        "status": payload.get("status"),
+                        "reason": payload.get("reason"),
+                    },
+                    "candidate_entry": None,
+                }
+    return None
+
+
+def _find_problem_candidate_for_record(record: dict, candidate_id: str) -> tuple[dict, dict] | None:
+    track = record.get("track") if isinstance(record.get("track"), dict) else {}
+    item = record.get("item") if isinstance(record.get("item"), dict) else {}
+    candidates = _problem_track_candidates_with_raw(
+        str(track.get("track_id") or ""),
+        item,
+        record.get("candidate_entry") if isinstance(record.get("candidate_entry"), dict) else None,
+    )
+    for payload, raw_candidate in candidates:
+        if str(payload.get("candidate_id") or "") == candidate_id:
+            return payload, raw_candidate
+    return None
+
+
+def _unique_target_path(dest_dir: Path, source_name: str) -> Path:
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    candidate = dest_dir / source_name
+    if not candidate.exists():
+        return candidate
+    stem = candidate.stem
+    suffix = candidate.suffix
+    for idx in range(1, 1000):
+        alt = dest_dir / f"{stem}_{idx}{suffix}"
+        if not alt.exists():
+            return alt
+    return dest_dir / f"{stem}_{uuid.uuid4().hex[:8]}{suffix}"
+
+
+def _copy_file_to_dir(source_path: str, dest_dir: Path) -> str:
+    source = Path(source_path)
+    target = _unique_target_path(dest_dir, source.name)
+    shutil.copy2(source, target)
+    return str(target)
+
+
+def _accepted_paths_for_root(root: str | None) -> list[str]:
+    if not root:
+        return []
+    accepted_dir = Path(root) / "accepted"
+    if not accepted_dir.is_dir():
+        return []
+    return sorted(str(path) for path in accepted_dir.iterdir() if path.is_file())
+
+
+def _quality_counts_from_summary(summary: dict) -> dict:
+    return {
+        "downloaded_ok": int(summary.get("accepted") or 0),
+        "not_found": int(summary.get("not_found") or 0),
+        "download_failed": int(summary.get("download_failed") or 0),
+        "low_confidence": 0,
+        "rejected_clean_or_censored": int(summary.get("rejected") or 0),
+        "rejected_radio": 0,
+        "version_mismatch": 0,
+        "duration_mismatch": 0,
+        "suspicious": int(summary.get("suspicious") or 0),
+        "manual_review": int(summary.get("manual_review") or 0),
+    }
+
+
+def _report_from_problem_groups(summary: dict, groups: dict[str, list]) -> dict:
+    failed_lines: list[str] = []
+    for group_name in ("not_found", "manual_review", "rejected", "download_failed", "suspicious"):
+        for item in groups.get(group_name) or []:
+            line = str(item.get("input_line") or "").strip()
+            if line:
+                failed_lines.append(line)
+    return {
+        "counts": {
+            "ok": int(summary.get("accepted") or 0),
+            "failed": len(failed_lines),
+            "skipped": 0,
+        },
+        "quality_counts": _quality_counts_from_summary(summary),
+        "result_summary": summary,
+        "failed": failed_lines[:_REPORT_LIST_CAP],
+        "failed_truncated": len(failed_lines) > _REPORT_LIST_CAP,
+        "skipped": [],
+        "skipped_truncated": False,
+    }
+
+
+def _refresh_job_from_problem_state(app: FastAPI, job_id: str, *, archive_ready: bool | None = None, detail: str | None = None) -> dict | None:
+    job = _job_get(app, job_id)
+    if job is None:
+        return None
+    summary, groups = _problem_tracks_payload_for_job(job)
+    report = _report_from_problem_groups(summary, groups)
+    root = str(job.get("saved_run") or job.get("work_root") or "")
+    accepted_paths = _accepted_paths_for_root(root)
+    download_ready = bool(job.get("download_ready")) if archive_ready is None else archive_ready
+    counts = report["counts"]
+    status = "completed" if summary.get("accepted") == summary.get("total") else "partial_success"
+    _job_update(
+        app,
+        job_id,
+        status=status,
+        phase="done",
+        detail=detail or job.get("detail"),
+        counts=counts,
+        quality_counts=report.get("quality_counts") or _zero_quality_counts(),
+        result_summary=summary,
+        report=report,
+        available_reports=_available_report_names_for_root(root),
+        download_ready=download_ready,
+        total_lines=int(summary.get("total") or job.get("total_lines") or len(accepted_paths)),
+    )
+    return _job_get(app, job_id)
+
+
+def _retry_candidates_for_statuses(job: dict, statuses: list[str]) -> list[dict]:
+    _summary, groups = _problem_tracks_payload_for_job(job)
+    out: list[dict] = []
+    if "NOT_FOUND" in statuses:
+        out.extend(groups.get("not_found") or [])
+    return out
+
+
 def _new_job_dict(
     job_id: str,
     file_name: str,
     delivery: str,
     total_lines: int,
     run_settings: dict | None = None,
+    parent_job_id: str | None = None,
 ) -> dict:
     cfg = _apply_run_settings(load_download_config_from_env(), run_settings)
     return {
         "job_id": job_id,
+        "parent_job_id": parent_job_id,
         "status": "queued",
         "phase": "queued",
         "detail": "Задача поставлена в очередь",
@@ -407,6 +1035,7 @@ def _new_job_dict(
         "current_track": None,
         "counts": {"ok": 0, "failed": 0, "skipped": 0},
         "quality_counts": _zero_quality_counts(),
+        "result_summary": _zero_result_summary(total_lines),
         "report": None,
         "available_reports": [],
         "download_ready": False,
@@ -430,9 +1059,10 @@ def _create_processing_job(
     delivery: str,
     anon_id: str | None,
     run_settings: dict | None = None,
+    parent_job_id: str | None = None,
 ) -> dict:
     job_id = uuid.uuid4().hex
-    job = _new_job_dict(job_id, file_name, delivery, len(clean), run_settings)
+    job = _new_job_dict(job_id, file_name, delivery, len(clean), run_settings, parent_job_id)
     with app.state.jobs_lock:
         app.state.jobs[job_id] = job
     asyncio.create_task(_run_job(app, job_id, clean, file_name, delivery, anon_id, run_settings))
@@ -487,6 +1117,13 @@ def _job_progress_callback(app: FastAPI, job_id: str):
             current_track=raw or None,
             counts=counts,
             quality_counts=quality_counts,
+            result_summary=_normalized_result_summary_from_counts(
+                {
+                    "total_lines": total,
+                    "counts": counts,
+                    "quality_counts": quality_counts,
+                }
+            ),
         )
 
     return on_progress
@@ -583,6 +1220,13 @@ async def _run_job(
             report=report,
             counts=report["counts"],
             quality_counts=report.get("quality_counts") or _zero_quality_counts(),
+            result_summary=report.get("result_summary") or _normalized_result_summary_from_counts(
+                {
+                    "total_lines": len(clean),
+                    "counts": report["counts"],
+                    "quality_counts": report.get("quality_counts") or {},
+                }
+            ),
             available_reports=_available_report_names_for_root(saved_dir),
             download_ready=False,
             current_track=None,
@@ -612,6 +1256,13 @@ async def _run_job(
             report=report,
             counts=report["counts"],
             quality_counts=report.get("quality_counts") or _zero_quality_counts(),
+            result_summary=report.get("result_summary") or _normalized_result_summary_from_counts(
+                {
+                    "total_lines": len(clean),
+                    "counts": report["counts"],
+                    "quality_counts": report.get("quality_counts") or {},
+                }
+            ),
             available_reports=_available_report_names_for_root(saved_dir),
             download_ready=True,
             download_path=os.path.join(saved_dir, download_name),
@@ -630,6 +1281,13 @@ async def _run_job(
         report=report,
         counts=report["counts"],
         quality_counts=report.get("quality_counts") or _zero_quality_counts(),
+        result_summary=report.get("result_summary") or _normalized_result_summary_from_counts(
+            {
+                "total_lines": len(clean),
+                "counts": report["counts"],
+                "quality_counts": report.get("quality_counts") or {},
+            }
+        ),
         available_reports=_available_report_names_for_root(work_root),
         current_track=None,
         download_ready=True,
@@ -791,15 +1449,7 @@ async def import_playlist_endpoint(
             detail=f"Слишком много строк после импорта ({len(clean)}), максимум {cap_lines}",
         )
 
-    preview = [
-        {
-            "artist": track.artist,
-            "title": track.title,
-            "duration_ms": track.duration_ms,
-            "line": track.to_playlist_line(),
-        }
-        for track in imported.tracks
-    ]
+    preview = analyze_preview_tracks(imported.tracks)
     file_links = {
         "txt": f"/api/imports/{import_id}/files/imported_playlist.txt",
         "json": f"/api/imports/{import_id}/files/imported_playlist.json",
@@ -912,6 +1562,7 @@ async def create_job(
     runtime_cfg = _apply_run_settings(load_download_config_from_env(), run_settings)
     job = {
         "job_id": job_id,
+        "parent_job_id": None,
         "status": "queued",
         "phase": "queued",
         "detail": "Задача поставлена в очередь",
@@ -924,6 +1575,7 @@ async def create_job(
         "current_track": None,
         "counts": {"ok": 0, "failed": 0, "skipped": 0},
         "quality_counts": _zero_quality_counts(),
+        "result_summary": _zero_result_summary(len(clean)),
         "report": None,
         "available_reports": [],
         "download_ready": False,
@@ -951,6 +1603,308 @@ async def get_job(request: Request, job_id: str):
     if job is None:
         raise HTTPException(404, detail="Задача не найдена")
     return _public_job(job)
+
+
+@app.get("/api/jobs/{job_id}/problem-tracks")
+async def get_job_problem_tracks(request: Request, job_id: str):
+    _touch_session(request)
+    job = _job_get(request.app, job_id)
+    if job is None:
+        raise HTTPException(404, detail="job not found")
+
+    summary, groups = _problem_tracks_payload_for_job(job)
+
+    return {
+        "job_id": job_id,
+        "summary": summary,
+        "groups": groups,
+    }
+
+
+@app.get("/api/jobs/{job_id}/tracks/{track_id}/candidates")
+async def get_job_track_candidates(request: Request, job_id: str, track_id: str):
+    _touch_session(request)
+    job = _job_get(request.app, job_id)
+    if job is None:
+        raise HTTPException(404, detail="job not found")
+
+    record = _problem_track_record_for_job(job, track_id)
+    if record is None:
+        raise HTTPException(404, detail="track not found")
+
+    track = record.get("track") if isinstance(record.get("track"), dict) else {}
+    candidates = [
+        payload
+        for payload, _raw_candidate in _problem_track_candidates_with_raw(
+            track_id,
+            record.get("item") if isinstance(record.get("item"), dict) else None,
+            record.get("candidate_entry") if isinstance(record.get("candidate_entry"), dict) else None,
+        )
+    ]
+
+    return {
+        "job_id": job_id,
+        "track_id": track_id,
+        "input_line": track.get("input_line"),
+        "status": track.get("status"),
+        "user_status_label": track.get("user_status_label"),
+        "decision_reason": track.get("decision_reason"),
+        "best_candidate": track.get("best_candidate"),
+        "candidates": candidates,
+    }
+
+
+@app.post("/api/jobs/{job_id}/manual-accept")
+async def manual_accept_track(request: Request, job_id: str):
+    _touch_session(request)
+    job = _job_get(request.app, job_id)
+    if job is None:
+        raise HTTPException(404, detail="job not found")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        raise HTTPException(400, detail="invalid payload")
+
+    track_id = str(payload.get("track_id") or "").strip()
+    candidate_id = str(payload.get("candidate_id") or "").strip()
+    if not track_id or not candidate_id:
+        raise HTTPException(400, detail="track_id and candidate_id are required")
+
+    record = _problem_track_record_for_job(job, track_id)
+    if record is None:
+        raise HTTPException(404, detail="track not found")
+    if str(record.get("group") or "") != "manual_review":
+        raise HTTPException(400, detail="manual accept is only available for manual review tracks")
+
+    found = _find_problem_candidate_for_record(record, candidate_id)
+    if found is None:
+        raise HTTPException(404, detail="candidate not found")
+    candidate_payload, raw_candidate = found
+
+    root = str(job.get("saved_run") or job.get("work_root") or "")
+    if not root:
+        raise HTTPException(409, detail="job workspace is not available")
+
+    item = record.get("item") if isinstance(record.get("item"), dict) else {}
+    accepted_dir = Path(root) / "accepted"
+    download_dir = Path(root) / "music"
+    download_dir.mkdir(parents=True, exist_ok=True)
+    accepted_path: str | None = None
+
+    best_candidate = record.get("track", {}).get("best_candidate") if isinstance(record.get("track"), dict) else None
+    existing_download = item.get("download", {}).get("file") if isinstance(item.get("download"), dict) else None
+    if (
+        isinstance(best_candidate, dict)
+        and str(best_candidate.get("candidate_id") or "") == candidate_id
+        and isinstance(existing_download, str)
+        and os.path.isfile(existing_download)
+    ):
+        accepted_path = _copy_file_to_dir(existing_download, accepted_dir)
+    else:
+        cfg = _apply_run_settings(load_download_config_from_env(), job.get("run_settings"))
+        input_track = str(record.get("track", {}).get("input_line") or item.get("input_track") or "")
+        quality_candidate = _quality_candidate_from_dict(raw_candidate, input_track)
+        temp_path, error, used_url = _download_quality_candidate(
+            input_track,
+            quality_candidate,
+            str(download_dir),
+            cfg,
+            quiet=True,
+        )
+        if not temp_path:
+            raise HTTPException(400, detail=error or "candidate download failed")
+        validation = quality_layer.validate_downloaded_file(temp_path, input_track, quality_candidate)
+        if validation.status in {quality_layer.STATUS_DOWNLOAD_FAILED, quality_layer.STATUS_SUSPICIOUS_FILE}:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+            raise HTTPException(400, detail=validation.reason or validation.status)
+        quality_candidate.file_size = validation.file_size
+        quality_candidate.bitrate = validation.bitrate
+        quality_candidate.duration_sec = validation.duration_sec or quality_candidate.duration_sec
+        accepted_path = quality_layer.move_file_to_dir(temp_path, accepted_dir)
+        raw_candidate = quality_layer.candidate_to_dict(quality_candidate) or raw_candidate
+
+    decisions = _read_manual_decisions(root)
+    decisions[track_id] = {
+        "action": "accept",
+        "status": "MANUALLY_ACCEPTED",
+        "track_id": track_id,
+        "input_line": str(record.get("track", {}).get("input_line") or item.get("input_track") or ""),
+        "candidate_id": candidate_id,
+        "candidate": _normalized_candidate_payload(track_id, raw_candidate, candidate_index=1),
+        "accepted_file": accepted_path,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    _write_manual_decisions(root, decisions)
+
+    refreshed = _refresh_job_from_problem_state(
+        request.app,
+        job_id,
+        archive_ready=False,
+        detail="Ручное принятие сохранено. Пересоберите архив, чтобы обновить выдачу.",
+    )
+    return _public_job(refreshed or job)
+
+
+@app.post("/api/jobs/{job_id}/manual-reject")
+async def manual_reject_track(request: Request, job_id: str):
+    _touch_session(request)
+    job = _job_get(request.app, job_id)
+    if job is None:
+        raise HTTPException(404, detail="job not found")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        raise HTTPException(400, detail="invalid payload")
+
+    track_id = str(payload.get("track_id") or "").strip()
+    candidate_id = str(payload.get("candidate_id") or "").strip()
+    reason = str(payload.get("reason") or "").strip() or "manual reject"
+    if not track_id or not candidate_id:
+        raise HTTPException(400, detail="track_id and candidate_id are required")
+
+    record = _problem_track_record_for_job(job, track_id)
+    if record is None:
+        raise HTTPException(404, detail="track not found")
+    if str(record.get("group") or "") != "manual_review":
+        raise HTTPException(400, detail="manual reject is only available for manual review tracks")
+
+    found = _find_problem_candidate_for_record(record, candidate_id)
+    if found is None:
+        raise HTTPException(404, detail="candidate not found")
+    candidate_payload, _raw_candidate = found
+
+    root = str(job.get("saved_run") or job.get("work_root") or "")
+    if not root:
+        raise HTTPException(409, detail="job workspace is not available")
+
+    decisions = _read_manual_decisions(root)
+    decisions[track_id] = {
+        "action": "reject",
+        "status": "MANUALLY_REJECTED",
+        "track_id": track_id,
+        "input_line": str(record.get("track", {}).get("input_line") or ""),
+        "candidate_id": candidate_id,
+        "candidate": candidate_payload,
+        "reason": reason,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    _write_manual_decisions(root, decisions)
+
+    refreshed = _refresh_job_from_problem_state(
+        request.app,
+        job_id,
+        archive_ready=False,
+        detail="Ручное отклонение сохранено. Пересоберите архив, если нужно обновить состав.",
+    )
+    return _public_job(refreshed or job)
+
+
+@app.post("/api/jobs/{job_id}/rebuild-archive")
+async def rebuild_archive(request: Request, job_id: str):
+    _touch_session(request)
+    job = _job_get(request.app, job_id)
+    if job is None:
+        raise HTTPException(404, detail="job not found")
+
+    root = str(job.get("saved_run") or job.get("work_root") or "")
+    if not root:
+        raise HTTPException(409, detail="job workspace is not available")
+
+    accepted_paths = _accepted_paths_for_root(root)
+    if not accepted_paths:
+        raise HTTPException(400, detail="no accepted files available for archive rebuild")
+
+    delivery = str(job.get("delivery") or "zip")
+    zip_path, download_name = _make_zip(accepted_paths, root, delivery)
+    refreshed = _refresh_job_from_problem_state(
+        request.app,
+        job_id,
+        archive_ready=True,
+        detail="Архив пересобран с учетом ручных решений.",
+    )
+    _job_update(
+        request.app,
+        job_id,
+        download_path=zip_path,
+        download_name=download_name,
+        cleanup_after_download=False,
+    )
+    latest = _job_get(request.app, job_id)
+    return _public_job(latest or refreshed or job)
+
+
+@app.post("/api/jobs/{job_id}/retry")
+async def retry_job(request: Request, job_id: str):
+    parent_job = _job_get(request.app, job_id)
+    if parent_job is None:
+        raise HTTPException(404, detail="job not found")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        raise HTTPException(400, detail="invalid retry payload")
+
+    statuses_raw = payload.get("statuses")
+    statuses = [str(item).strip().upper() for item in statuses_raw] if isinstance(statuses_raw, list) else []
+    if not statuses:
+        raise HTTPException(400, detail="statuses are required")
+    unsupported = [status for status in statuses if status != quality_layer.STATUS_NOT_FOUND]
+    if unsupported:
+        raise HTTPException(400, detail="only NOT_FOUND retry is supported at this stage")
+
+    track_ids_raw = payload.get("track_ids")
+    track_ids = {str(item).strip() for item in track_ids_raw} if isinstance(track_ids_raw, list) else set()
+    candidates = _retry_candidates_for_statuses(parent_job, statuses)
+    if track_ids:
+        candidates = [item for item in candidates if str(item.get("track_id") or "") in track_ids]
+
+    clean = [str(item.get("input_line") or "").strip() for item in candidates if str(item.get("input_line") or "").strip()]
+    if not clean:
+        raise HTTPException(400, detail="no tracks matched selected statuses/track_ids")
+
+    anon = _touch_session(request)
+    run_settings = _normalize_retry_run_settings(parent_job.get("run_settings"), payload)
+    delivery = str(parent_job.get("delivery") or "zip")
+    retry_job_dict = _create_processing_job(
+        request.app,
+        clean,
+        file_name=f"retry:{job_id}",
+        delivery=delivery if delivery in {"zip", "tracks"} else "zip",
+        anon_id=anon,
+        run_settings=run_settings,
+        parent_job_id=job_id,
+    )
+    return JSONResponse(status_code=202, content=_public_job(retry_job_dict))
+
+
+@app.get("/api/jobs/{job_id}/not-found.txt")
+async def download_job_not_found_txt(request: Request, job_id: str):
+    _touch_session(request)
+    job = _job_get(request.app, job_id)
+    if job is None:
+        raise HTTPException(404, detail="job not found")
+
+    root = str(job.get("saved_run") or job.get("work_root") or "")
+    lines = _not_found_lines(root, job)
+    body = "\n".join(lines)
+    if body:
+        body += "\n"
+    return PlainTextResponse(
+        body,
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{job_id}-not-found.txt"'},
+    )
 
 
 @app.get("/api/jobs/{job_id}/download")

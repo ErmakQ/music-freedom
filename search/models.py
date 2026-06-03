@@ -14,6 +14,7 @@ class TrackQuery:
     expected_duration_sec: int | None = None
     generated_queries: list[str] = field(default_factory=list)
     requested_flags: list[str] = field(default_factory=list)
+    cache_context: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -62,6 +63,9 @@ class SearchDecision:
     decision_reason: str = ""
     provider_results: list[ProviderResult] = field(default_factory=list)
     from_cache: bool = False
+    cache_key: str | None = None
+    cache_hit_type: str | None = None
+    skipped_selenium_reason: str | None = None
 
     def to_candidate_report(self) -> dict[str, Any]:
         candidate_dicts: list[dict[str, Any]] = []
@@ -82,6 +86,9 @@ class SearchDecision:
             "status": self.status,
             "reason": self.reason,
             "from_cache": self.from_cache,
+            "cache_key": self.cache_key,
+            "cache_hit_type": self.cache_hit_type,
+            "skipped_selenium_reason": self.skipped_selenium_reason,
             "provider_results": [
                 {
                     "provider": result.provider,

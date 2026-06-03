@@ -29,6 +29,9 @@ class ImportedTrack:
     def to_playlist_line(self) -> str:
         artist = (self.artist or "").strip()
         title = self.title.strip()
+        version = (self.version or "").strip()
+        if version and version.casefold() not in title.casefold():
+            title = f"{title} ({version})".strip()
         return f"{artist} - {title}" if artist else title
 
     def to_dict(self) -> dict[str, Any]:

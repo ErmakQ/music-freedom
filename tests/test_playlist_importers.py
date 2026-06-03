@@ -17,6 +17,8 @@ from playlist_importers import (
     parse_yandex_playlist_url,
     save_imported_playlist,
 )
+from playlist_importers.base import ImportedTrack
+from playlist_importers.preview_diagnostics import analyze_preview_tracks
 from unittest.mock import patch
 
 from playlist_importers.yandex_music import extract_from_next_data, extract_yandex_tracks_from_dom
@@ -239,6 +241,30 @@ class PlaylistImporterTests(unittest.TestCase):
         self.assertEqual(len(playlist.tracks), 2)
         self.assertEqual(playlist.tracks[0].artist, "Artist")
         self.assertEqual(playlist.tracks[0].title, "Song")
+
+    def test_plain_text_keeps_extra_dash_in_title(self) -> None:
+        playlist = import_playlist(content="Flaffy Fon - Голова - бумага")
+        self.assertEqual(len(playlist.tracks), 1)
+        self.assertEqual(playlist.tracks[0].artist, "Flaffy Fon")
+        self.assertEqual(playlist.tracks[0].title, "Голова - бумага")
+
+    def test_imported_track_to_playlist_line_keeps_explicit_version(self) -> None:
+        track = ImportedTrack(artist="EVO", title="Танцуй", version="Cover")
+        self.assertEqual(track.to_playlist_line(), "EVO - Танцуй (Cover)")
+
+    def test_preview_diagnostics_flags_versions_and_extra_dash(self) -> None:
+        tracks = [
+            ImportedTrack(artist="tripperbeats, Flo Fire, LeMoris", title="Ride - DnB"),
+            ImportedTrack(artist="EVO", title="Танцуй", version="Cover"),
+            ImportedTrack(artist="GERXMVP", title="Olympus (Slowed)"),
+            ImportedTrack(artist="BUSHIDO ZHO", title="далеко (большой Бушизм) [prod. by wex & heysubr]"),
+        ]
+        preview = analyze_preview_tracks(tracks)
+
+        self.assertIn("extra_dash_in_title", preview[0]["warnings"])
+        self.assertIn("explicit_version_cover", preview[1]["warnings"])
+        self.assertIn("explicit_version_slowed", preview[2]["warnings"])
+        self.assertIn("contains_prod_by", preview[3]["warnings"])
 
     @patch("playlist_importers.yandex_music._playlist_from_remote_html")
     @patch("playlist_importers.yandex_music._playlist_from_public_api")
