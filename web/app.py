@@ -24,12 +24,13 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 from starlette.middleware.sessions import SessionMiddleware
@@ -506,6 +507,26 @@ _REPORT_DOWNLOAD_NAMES = {
     "manual_decisions.json": "manual_decisions.json",
 }
 
+_SAFE_ENV_KEYS = (
+    "SEARCH_MODE",
+    "SEARCH_CACHE_ENABLED",
+    "SEARCH_CACHE_TTL_DAYS",
+    "NEGATIVE_CACHE_TTL_HOURS",
+    "BYPASS_NEGATIVE_CACHE_FOR_DEEP",
+    "ENABLE_SELENIUM_FALLBACK",
+    "PROVIDER_TIMEOUT_SEC",
+    "HTTP_SEARCH_CONCURRENCY",
+    "DOWNLOAD_CONCURRENCY",
+    "SELENIUM_MAX_WORKERS",
+    "LMUSIC_FALLBACK_ENABLED",
+    "ZVYKI_FALLBACK_ENABLED",
+    "SITE_ORIGIN",
+    "LMUSIC_ORIGIN",
+    "ZVYKI_ORIGIN",
+    "MAX_CONCURRENT_JOBS",
+    "WEB_CORS_ORIGINS",
+)
+
 _IMPORT_DOWNLOAD_NAMES = {
     "imported_playlist.txt",
     "imported_playlist.json",
@@ -628,6 +649,122 @@ def _quality_candidate_from_dict(candidate: dict, input_track: str) -> quality_l
     return quality_candidate
 
 
+def _provider_enabled_map(job: dict | None = None) -> dict[str, bool]:
+    runtime = job.get("runtime_config") if isinstance(job, dict) and isinstance(job.get("runtime_config"), dict) else {}
+    return {
+        "Hitmo": True,
+        "LMusic": bool(runtime.get("lmusic_fallback_enabled", True)),
+        "Zvyki": bool(runtime.get("zvyki_fallback_enabled", True)),
+        "Selenium": bool(runtime.get("enable_selenium_fallback", False)),
+        "Cache": bool(runtime.get("search_cache_enabled", True)),
+    }
+
+
+def _provider_label(raw_provider: str) -> str:
+    provider = str(raw_provider or "").lower()
+    if provider.startswith("hitmo:"):
+        return "Hitmo"
+    if provider.startswith("lmusic:"):
+        return "LMusic"
+    if provider.startswith("zvyki:"):
+        return "Zvyki"
+    if provider.startswith("selenium:"):
+        return "Selenium"
+    if provider == "cache":
+        return "Cache"
+    return raw_provider or "Unknown"
+
+
+def _provider_diagnostics(
+    job: dict | None,
+    provider_results: list | None,
+    *,
+    from_cache: bool | None = None,
+    cache_hit_type: str | None = None,
+) -> list[dict]:
+    enabled_map = _provider_enabled_map(job)
+    out: dict[str, dict] = {
+        label: {
+            "provider": label,
+            "enabled": enabled,
+            "candidate_count": 0,
+            "errors": [],
+            "error_count": 0,
+            "timeout": False,
+            "statuses": [],
+            "cache_hits": 0,
+            "negative_hits": 0,
+        }
+        for label, enabled in enabled_map.items()
+    }
+    for result in provider_results or []:
+        if not isinstance(result, dict):
+            continue
+        label = _provider_label(str(result.get("provider") or ""))
+        bucket = out.setdefault(
+            label,
+            {
+                "provider": label,
+                "enabled": True,
+                "candidate_count": 0,
+                "errors": [],
+                "error_count": 0,
+                "timeout": False,
+                "statuses": [],
+                "cache_hits": 0,
+                "negative_hits": 0,
+            },
+        )
+        bucket["candidate_count"] += int(result.get("candidate_count") or 0)
+        status = str(result.get("status") or "")
+        reason = str(result.get("reason") or "")
+        if status:
+            bucket["statuses"].append(status)
+        lowered = f"{status} {reason}".lower()
+        if "timeout" in lowered:
+            bucket["timeout"] = True
+        if status and status not in {"OK", "DISABLED"} and reason:
+            bucket["errors"].append(reason)
+        elif reason and any(token in lowered for token in ("error", "exception", "failed", "timeout", "miss")):
+            bucket["errors"].append(reason)
+    cache_bucket = out.setdefault(
+        "Cache",
+        {
+            "provider": "Cache",
+            "enabled": enabled_map.get("Cache", True),
+            "candidate_count": 0,
+            "errors": [],
+            "error_count": 0,
+            "timeout": False,
+            "statuses": [],
+            "cache_hits": 0,
+            "negative_hits": 0,
+        },
+    )
+    if from_cache:
+        cache_bucket["cache_hits"] = 1
+        if str(cache_hit_type or "") == "negative":
+            cache_bucket["negative_hits"] = 1
+    result_list: list[dict] = []
+    for label in ("Hitmo", "LMusic", "Zvyki", "Selenium", "Cache"):
+        bucket = out.get(label)
+        if not bucket:
+            continue
+        unique_errors = [item for idx, item in enumerate(bucket["errors"]) if item and item not in bucket["errors"][:idx]]
+        unique_statuses = [item for idx, item in enumerate(bucket["statuses"]) if item and item not in bucket["statuses"][:idx]]
+        result_list.append(
+            {
+                **bucket,
+                "errors": unique_errors,
+                "error_count": len(unique_errors),
+                "statuses": unique_statuses,
+                "status": unique_statuses[0] if unique_statuses else None,
+                "reason": unique_errors[0] if unique_errors else None,
+            }
+        )
+    return result_list
+
+
 def _normalized_candidate_payload(
     track_id: str,
     candidate: dict | None,
@@ -706,22 +843,32 @@ def _problem_track_candidates_with_raw(
     return out
 
 
-def _problem_track_payload(index: int, item: dict, candidate_entry: dict | None = None) -> dict:
+def _problem_track_payload(index: int, item: dict, candidate_entry: dict | None = None, job: dict | None = None) -> dict:
     input_line = str(item.get("input_track") or "")
     artist, title = parse_artist_title(input_line)
     track_id = _track_id(index, input_line)
     best_candidate = _best_candidate_payload(track_id, item, candidate_entry)
     decision_reason = None
     from_cache = None
-    provider_summary = []
+    cache_hit_type = None
+    skipped_selenium_reason = None
+    provider_results = []
     if candidate_entry:
         decision_reason = candidate_entry.get("decision_reason")
         from_cache = candidate_entry.get("from_cache")
-        provider_results = candidate_entry.get("provider_results")
-        if isinstance(provider_results, list):
-            provider_summary = provider_results
+        cache_hit_type = candidate_entry.get("cache_hit_type")
+        skipped_selenium_reason = candidate_entry.get("skipped_selenium_reason")
+        raw_provider_results = candidate_entry.get("provider_results")
+        if isinstance(raw_provider_results, list):
+            provider_results = raw_provider_results
     if not decision_reason and isinstance(best_candidate, dict):
         decision_reason = best_candidate.get("decision_reason")
+    provider_summary = _provider_diagnostics(
+        job,
+        provider_results,
+        from_cache=from_cache,
+        cache_hit_type=cache_hit_type,
+    )
     return {
         "track_id": track_id,
         "index": index,
@@ -735,8 +882,102 @@ def _problem_track_payload(index: int, item: dict, candidate_entry: dict | None 
         "best_candidate": best_candidate,
         "score": best_candidate.get("score") if isinstance(best_candidate, dict) else None,
         "from_cache": from_cache,
+        "cache_hit_type": cache_hit_type,
+        "skipped_selenium_reason": skipped_selenium_reason,
+        "provider_errors": [
+            error
+            for provider in provider_summary
+            for error in (provider.get("errors") or [])
+            if isinstance(error, str) and error
+        ],
         "provider_summary": provider_summary,
     }
+
+
+def _run_info_text(job_id: str, job: dict) -> str:
+    lines = [
+        f"job_id: {job_id}",
+        f"status: {job.get('status') or '-'}",
+        f"phase: {job.get('phase') or '-'}",
+        f"file_name: {job.get('file_name') or '-'}",
+        f"delivery: {job.get('delivery') or '-'}",
+        f"total_lines: {job.get('total_lines') or 0}",
+        f"saved_run: {job.get('saved_run') or '-'}",
+        f"work_root: {job.get('work_root') or '-'}",
+        f"download_name: {job.get('download_name') or '-'}",
+        f"detail: {job.get('detail') or '-'}",
+    ]
+    runtime = job.get("runtime_config") if isinstance(job.get("runtime_config"), dict) else {}
+    if runtime:
+        lines.append("runtime_config:")
+        for key in sorted(runtime):
+            lines.append(f"  {key}: {runtime[key]}")
+    return "\n".join(lines) + "\n"
+
+
+def _safe_env_text(job: dict | None = None) -> str:
+    lines = ["safe_environment:"]
+    for key in _SAFE_ENV_KEYS:
+        value = os.getenv(key)
+        if value is not None:
+            lines.append(f"{key}={value}")
+    runtime = job.get("runtime_config") if isinstance(job, dict) and isinstance(job.get("runtime_config"), dict) else {}
+    if runtime:
+        lines.append("")
+        lines.append("runtime_config:")
+        for key in sorted(runtime):
+            lines.append(f"{key}={runtime[key]}")
+    run_settings = job.get("run_settings") if isinstance(job, dict) and isinstance(job.get("run_settings"), dict) else {}
+    if run_settings:
+        lines.append("")
+        lines.append("run_settings:")
+        for key in sorted(run_settings):
+            lines.append(f"{key}={run_settings[key]}")
+    return "\n".join(lines) + "\n"
+
+
+def _problem_tracks_json_payload(job_id: str, job: dict) -> dict:
+    summary, groups = _problem_tracks_payload_for_job(job)
+    return {
+        "job_id": job_id,
+        "summary": summary,
+        "groups": groups,
+    }
+
+
+def _diagnostic_zip_bytes(job_id: str, job: dict) -> bytes:
+    root = Path(str(job.get("saved_run") or job.get("work_root") or "")).resolve() if str(job.get("saved_run") or job.get("work_root") or "") else None
+    summary, groups = _problem_tracks_payload_for_job(job)
+    problem_payload = {
+        "job_id": job_id,
+        "summary": summary,
+        "groups": groups,
+    }
+    not_found_lines = _not_found_lines(str(root) if root else None, job)
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        run_info_path = root / "run_info.txt" if root else None
+        if run_info_path and run_info_path.is_file():
+            archive.writestr("run_info.txt", run_info_path.read_text(encoding="utf-8"))
+        else:
+            archive.writestr("run_info.txt", _run_info_text(job_id, job))
+
+        for name in ("quality_report.json", "quality_report.csv", "manual_review.csv", "candidates.json"):
+            path = root / name if root else None
+            if path and path.is_file():
+                archive.writestr(name, path.read_bytes())
+
+        job_log_path = root / "job.log" if root else None
+        downloaded_log_path = root / "downloaded.log" if root else None
+        if downloaded_log_path and downloaded_log_path.is_file():
+            archive.writestr("downloaded.log", downloaded_log_path.read_text(encoding="utf-8"))
+        elif job_log_path and job_log_path.is_file():
+            archive.writestr("downloaded.log", job_log_path.read_text(encoding="utf-8"))
+
+        archive.writestr("not_found.txt", ("\n".join(not_found_lines) + ("\n" if not_found_lines else "")).encode("utf-8"))
+        archive.writestr("problem_tracks.json", json.dumps(problem_payload, ensure_ascii=False, indent=2).encode("utf-8"))
+        archive.writestr("env_safe.txt", _safe_env_text(job).encode("utf-8"))
+    return buffer.getvalue()
 
 
 def _empty_problem_groups() -> dict[str, list]:
@@ -749,7 +990,7 @@ def _empty_problem_groups() -> dict[str, list]:
     }
 
 
-def _problem_track_records_from_reports(root: str | None) -> tuple[dict | None, dict[str, list], dict[str, dict]]:
+def _problem_track_records_from_reports(root: str | None, job: dict | None = None) -> tuple[dict | None, dict[str, list], dict[str, dict]]:
     if not root:
         return None, _empty_problem_groups(), {}
     root_path = Path(root)
@@ -775,7 +1016,7 @@ def _problem_track_records_from_reports(root: str | None) -> tuple[dict | None, 
         if not group:
             continue
         candidate_entry = candidates_lookup.get(str(item.get("input_track") or ""))
-        payload = _problem_track_payload(index, item, candidate_entry)
+        payload = _problem_track_payload(index, item, candidate_entry, job)
         groups[group].append(payload)
         records[payload["track_id"]] = {
             "group": group,
@@ -823,8 +1064,8 @@ def _problem_track_records_from_reports(root: str | None) -> tuple[dict | None, 
     return summary, groups, records
 
 
-def _problem_tracks_from_reports(root: str | None) -> tuple[dict | None, dict[str, list]]:
-    summary, groups, _records = _problem_track_records_from_reports(root)
+def _problem_tracks_from_reports(root: str | None, job: dict | None = None) -> tuple[dict | None, dict[str, list]]:
+    summary, groups, _records = _problem_track_records_from_reports(root, job)
     return summary, groups
 
 
@@ -842,12 +1083,12 @@ def _problem_tracks_fallback(job: dict) -> tuple[dict, dict[str, list]]:
                 "status": quality_layer.STATUS_NEEDS_MANUAL_REVIEW,
                 "reason": None,
             }
-            groups["manual_review"].append(_problem_track_payload(index, item, None))
+            groups["manual_review"].append(_problem_track_payload(index, item, None, job))
     return summary, groups
 
 
 def _not_found_lines(root: str | None, job: dict) -> list[str]:
-    _summary, groups = _problem_tracks_from_reports(root)
+    _summary, groups = _problem_tracks_from_reports(root, job)
     if groups.get("not_found"):
         return [
             str(item.get("input_line") or "").strip()
@@ -864,7 +1105,7 @@ def _not_found_lines(root: str | None, job: dict) -> list[str]:
 
 def _problem_tracks_payload_for_job(job: dict) -> tuple[dict, dict[str, list]]:
     root = str(job.get("saved_run") or job.get("work_root") or "")
-    summary, groups = _problem_tracks_from_reports(root)
+    summary, groups = _problem_tracks_from_reports(root, job)
     if summary is None:
         summary, groups = _problem_tracks_fallback(job)
     return summary, groups
@@ -872,7 +1113,7 @@ def _problem_tracks_payload_for_job(job: dict) -> tuple[dict, dict[str, list]]:
 
 def _problem_track_record_for_job(job: dict, track_id: str) -> dict | None:
     root = str(job.get("saved_run") or job.get("work_root") or "")
-    _summary, _groups, records = _problem_track_records_from_reports(root)
+    _summary, _groups, records = _problem_track_records_from_reports(root, job)
     record = records.get(track_id)
     if record is not None:
         return record
@@ -1006,8 +1247,27 @@ def _refresh_job_from_problem_state(app: FastAPI, job_id: str, *, archive_ready:
 def _retry_candidates_for_statuses(job: dict, statuses: list[str]) -> list[dict]:
     _summary, groups = _problem_tracks_payload_for_job(job)
     out: list[dict] = []
-    if "NOT_FOUND" in statuses:
-        out.extend(groups.get("not_found") or [])
+    wanted = {str(status).strip().upper() for status in statuses if str(status).strip()}
+    status_groups = {
+        quality_layer.STATUS_NOT_FOUND: "not_found",
+        quality_layer.STATUS_DOWNLOAD_FAILED: "download_failed",
+        quality_layer.STATUS_SUSPICIOUS_FILE: "suspicious",
+        quality_layer.STATUS_LOW_CONFIDENCE_MATCH: "manual_review",
+        quality_layer.STATUS_NEEDS_MANUAL_REVIEW: "manual_review",
+    }
+    seen: set[str] = set()
+    for status in wanted:
+        group_name = status_groups.get(status)
+        if not group_name:
+            continue
+        for item in groups.get(group_name) or []:
+            item_status = str(item.get("status") or "").strip().upper()
+            track_id = str(item.get("track_id") or "")
+            if item_status != status or not track_id or track_id in seen:
+                continue
+            seen.add(track_id)
+            out.append(item)
+    out.sort(key=lambda item: int(item.get("index") or 0))
     return out
 
 
@@ -1649,6 +1909,11 @@ async def get_job_track_candidates(request: Request, job_id: str, track_id: str)
         "status": track.get("status"),
         "user_status_label": track.get("user_status_label"),
         "decision_reason": track.get("decision_reason"),
+        "from_cache": track.get("from_cache"),
+        "cache_hit_type": track.get("cache_hit_type"),
+        "skipped_selenium_reason": track.get("skipped_selenium_reason"),
+        "provider_errors": track.get("provider_errors") or [],
+        "provider_summary": track.get("provider_summary") or [],
         "best_candidate": track.get("best_candidate"),
         "candidates": candidates,
     }
@@ -1859,9 +2124,16 @@ async def retry_job(request: Request, job_id: str):
     statuses = [str(item).strip().upper() for item in statuses_raw] if isinstance(statuses_raw, list) else []
     if not statuses:
         raise HTTPException(400, detail="statuses are required")
-    unsupported = [status for status in statuses if status != quality_layer.STATUS_NOT_FOUND]
+    supported_statuses = {
+        quality_layer.STATUS_NOT_FOUND,
+        quality_layer.STATUS_DOWNLOAD_FAILED,
+        quality_layer.STATUS_LOW_CONFIDENCE_MATCH,
+        quality_layer.STATUS_NEEDS_MANUAL_REVIEW,
+        quality_layer.STATUS_SUSPICIOUS_FILE,
+    }
+    unsupported = [status for status in statuses if status not in supported_statuses]
     if unsupported:
-        raise HTTPException(400, detail="only NOT_FOUND retry is supported at this stage")
+        raise HTTPException(400, detail=f"unsupported retry statuses: {', '.join(sorted(set(unsupported)))}")
 
     track_ids_raw = payload.get("track_ids")
     track_ids = {str(item).strip() for item in track_ids_raw} if isinstance(track_ids_raw, list) else set()
@@ -1869,12 +2141,33 @@ async def retry_job(request: Request, job_id: str):
     if track_ids:
         candidates = [item for item in candidates if str(item.get("track_id") or "") in track_ids]
 
-    clean = [str(item.get("input_line") or "").strip() for item in candidates if str(item.get("input_line") or "").strip()]
+    custom_queries_raw = payload.get("custom_queries")
+    custom_queries = {
+        str(track_id).strip(): str(query).strip()
+        for track_id, query in custom_queries_raw.items()
+        if str(track_id).strip() and str(query).strip()
+    } if isinstance(custom_queries_raw, dict) else {}
+
+    clean: list[str] = []
+    effective_custom_queries: dict[str, str] = {}
+    for item in candidates:
+        track_id = str(item.get("track_id") or "").strip()
+        input_line = str(item.get("input_line") or "").strip()
+        if not input_line:
+            continue
+        query = custom_queries.get(track_id) or input_line
+        clean.append(query)
+        if track_id and track_id in custom_queries:
+            effective_custom_queries[track_id] = custom_queries[track_id]
     if not clean:
         raise HTTPException(400, detail="no tracks matched selected statuses/track_ids")
 
     anon = _touch_session(request)
     run_settings = _normalize_retry_run_settings(parent_job.get("run_settings"), payload)
+    if effective_custom_queries:
+        run_settings["custom_queries"] = effective_custom_queries
+    else:
+        run_settings.pop("custom_queries", None)
     delivery = str(parent_job.get("delivery") or "zip")
     retry_job_dict = _create_processing_job(
         request.app,
@@ -1904,6 +2197,21 @@ async def download_job_not_found_txt(request: Request, job_id: str):
         body,
         media_type="text/plain; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{job_id}-not-found.txt"'},
+    )
+
+
+@app.get("/api/jobs/{job_id}/diagnostic.zip")
+async def download_job_diagnostic_zip(request: Request, job_id: str):
+    _touch_session(request)
+    job = _job_get(request.app, job_id)
+    if job is None:
+        raise HTTPException(404, detail="job not found")
+
+    payload = _diagnostic_zip_bytes(job_id, job)
+    return Response(
+        payload,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{job_id}-diagnostic.zip"'},
     )
 
 
@@ -1950,14 +2258,14 @@ async def download_job_report(request: Request, job_id: str, report_name: str):
     _touch_session(request)
     job = _job_get(request.app, job_id)
     if job is None:
-        raise HTTPException(404, detail="Р—Р°РґР°С‡Р° РЅРµ РЅР°Р№РґРµРЅР°")
+        raise HTTPException(404, detail="Задача не найдена")
     if report_name not in _REPORT_DOWNLOAD_NAMES:
-        raise HTTPException(404, detail="РћС‚С‡РµС‚ РЅРµ РЅР°Р№РґРµРЅ")
+        raise HTTPException(404, detail="Отчет не найден")
 
     root = str(job.get("saved_run") or job.get("work_root") or "")
     report_path = Path(root) / report_name
     if not root or not report_path.is_file():
-        raise HTTPException(404, detail="РћС‚С‡РµС‚ РЅРµРґРѕСЃС‚СѓРїРµРЅ")
+        raise HTTPException(404, detail="Отчет недоступен")
 
     media_type = "application/json" if report_name.endswith(".json") else "text/csv"
     return FileResponse(

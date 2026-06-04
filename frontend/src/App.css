@@ -1566,6 +1566,11 @@
   align-items: start;
 }
 
+.problem-table-not-found .problem-table-head,
+.problem-table-row-selectable {
+  grid-template-columns: 72px 56px minmax(220px, 1.5fr) minmax(140px, 1fr) minmax(180px, 1.3fr) minmax(180px, 1.2fr) 82px 76px minmax(140px, 1fr);
+}
+
 .problem-table-head {
   padding: 0 0.2rem;
   color: var(--muted);
@@ -1601,6 +1606,18 @@
 
 .problem-actions {
   grid-auto-flow: row;
+}
+
+.problem-select {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 40px;
+}
+
+.problem-select input {
+  width: 18px;
+  height: 18px;
 }
 
 .problem-empty {
@@ -2007,6 +2024,10 @@ a:focus-visible,
   }
 
   .problem-table-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .problem-table-row-selectable {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 

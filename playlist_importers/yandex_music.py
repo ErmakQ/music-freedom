@@ -468,7 +468,7 @@ def parse_yandex_playlist_url(url: str) -> ImportedPlaylist:
     api_playlist = _playlist_from_public_api(owner, kind, detected_url)
     if api_playlist is not None and api_playlist.tracks:
         if err:
-            api_playlist.warnings.append(f"{err}: owner/kind РЅРµ СѓРґР°Р»РѕСЃСЊ РёР·РІР»РµС‡СЊ РёР· URL.")
+            api_playlist.warnings.append(f"{err}: owner/kind не удалось извлечь из URL.")
         return api_playlist
 
     warnings_from_api = api_playlist.warnings[:] if api_playlist is not None else []

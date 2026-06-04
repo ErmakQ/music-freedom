@@ -200,12 +200,22 @@ type ProblemTrack = {
   } | null;
   score?: number | null;
   from_cache?: boolean | null;
+  cache_hit_type?: string | null;
+  skipped_selenium_reason?: string | null;
+  provider_errors?: string[];
   provider_summary?: Array<{
     provider: string;
-    status?: string;
+    enabled?: boolean;
+    status?: string | null;
+    statuses?: string[];
     reason?: string | null;
     from_cache?: boolean;
     candidate_count?: number;
+    errors?: string[];
+    error_count?: number;
+    timeout?: boolean;
+    cache_hits?: number;
+    negative_hits?: number;
   }>;
 };
 
@@ -246,6 +256,11 @@ type TrackCandidatesResponse = {
   status?: string | null;
   user_status_label?: string | null;
   decision_reason?: string | null;
+  from_cache?: boolean | null;
+  cache_hit_type?: string | null;
+  skipped_selenium_reason?: string | null;
+  provider_errors?: string[];
+  provider_summary?: ProblemTrack["provider_summary"];
   best_candidate?: TrackCandidate | null;
   candidates: TrackCandidate[];
 };
@@ -400,6 +415,52 @@ function problemTrackReason(track: ProblemTrack) {
 function cacheLabel(value?: boolean | null) {
   if (value == null) return "—";
   return value ? "Да" : "Нет";
+}
+
+function providerSummaryText(summary?: ProblemTrack["provider_summary"]) {
+  if (!summary?.length) return "";
+  return summary
+    .map((item) => {
+      const parts: string[] = [];
+      if (typeof item.candidate_count === "number") {
+        parts.push(`candidates ${item.candidate_count}`);
+      }
+      if (item.error_count) {
+        parts.push(`errors ${item.error_count}`);
+      }
+      if (item.timeout) {
+        parts.push("timeout");
+      }
+      if ((item.provider || "").toLowerCase() === "cache") {
+        if (item.cache_hits) parts.push(`hits ${item.cache_hits}`);
+        if (item.negative_hits) parts.push(`negative ${item.negative_hits}`);
+      }
+      const reason = item.reason || item.errors?.[0] || item.status || item.statuses?.[0];
+      if (reason) parts.push(reason);
+      return `${item.provider}: ${parts.join(", ") || "—"}`;
+    })
+    .join(" · ");
+}
+
+function problemTrackDiagnostics(track: Pick<ProblemTrack, "from_cache" | "provider_errors" | "skipped_selenium_reason" | "decision_reason" | "provider_summary">) {
+  const parts: string[] = [];
+  if (track.from_cache != null) {
+    parts.push(`Кэш: ${cacheLabel(track.from_cache)}`);
+  }
+  const providerError = track.provider_errors?.[0];
+  if (providerError) {
+    parts.push(`Ошибки провайдеров: ${providerError}`);
+  }
+  if (track.skipped_selenium_reason) {
+    parts.push(`Selenium: ${track.skipped_selenium_reason}`);
+  }
+  if (track.decision_reason) {
+    parts.push(`Decision: ${track.decision_reason}`);
+  }
+  if (!parts.length && track.provider_summary?.length) {
+    parts.push(providerSummaryText(track.provider_summary));
+  }
+  return parts;
 }
 
 function formatDurationSeconds(value?: number | null) {
@@ -1803,6 +1864,10 @@ function CandidateInspectorModal({
             </div>
           </div>
 
+          {problemTrackDiagnostics(track).length ? (
+            <p className="manual-review-note">{problemTrackDiagnostics(track).join(" · ")}</p>
+          ) : null}
+
           {loading ? <div className="problem-tracks-notice" role="status">Загружаем кандидатов…</div> : null}
           {error ? <div className="problem-tracks-notice" role="status">{error}</div> : null}
 
@@ -1908,6 +1973,7 @@ function ProblemTracksSection({
   const [candidateLoading, setCandidateLoading] = useState(false);
   const [candidateError, setCandidateError] = useState<string | null>(null);
   const [selectedManualTrackIds, setSelectedManualTrackIds] = useState<string[]>([]);
+  const [selectedNotFoundTrackIds, setSelectedNotFoundTrackIds] = useState<string[]>([]);
   const [manualActionBusy, setManualActionBusy] = useState(false);
   const groups = data?.groups ?? {
     not_found: [],
@@ -1932,6 +1998,7 @@ function ProblemTracksSection({
     setShowList(false);
     setCopyMessage(null);
     setSelectedManualTrackIds([]);
+    setSelectedNotFoundTrackIds([]);
   }, [activeTab, data?.job_id]);
 
   useEffect(() => {
@@ -1985,6 +2052,12 @@ function ProblemTracksSection({
 
   function toggleManualTrack(trackId: string) {
     setSelectedManualTrackIds((current) =>
+      current.includes(trackId) ? current.filter((item) => item !== trackId) : [...current, trackId],
+    );
+  }
+
+  function toggleNotFoundTrack(trackId: string) {
+    setSelectedNotFoundTrackIds((current) =>
       current.includes(trackId) ? current.filter((item) => item !== trackId) : [...current, trackId],
     );
   }
@@ -2074,6 +2147,7 @@ function ProblemTracksSection({
   const hasProblems = tabs.some(({ key }) => groups[key].length > 0);
   const notFoundDownloadHref = job ? `${API_BASE}/api/jobs/${job.job_id}/not-found.txt` : "";
   const selectedManualTracks = (groups.manual_review ?? []).filter((track) => selectedManualTrackIds.includes(track.track_id));
+  const selectedNotFoundTracks = (groups.not_found ?? []).filter((track) => selectedNotFoundTrackIds.includes(track.track_id));
   if (!job || (job.status !== "completed" && job.status !== "partial_success" && job.status !== "failed")) {
     return null;
   }
@@ -2167,6 +2241,54 @@ function ProblemTracksSection({
               })}
             >
               Повторить глубоким поиском
+            </button>
+            <button
+              type="button"
+              className="button"
+              disabled={!selectedNotFoundTracks.length || retryBusy}
+              onClick={() => onRetryNotFound({
+                statuses: ["NOT_FOUND"],
+                track_ids: selectedNotFoundTracks.map((track) => track.track_id),
+                search_mode: "balanced",
+                bypass_cache: false,
+                enable_selenium: false,
+                provider_timeout_sec: 8,
+                custom_queries: {},
+              })}
+            >
+              Повторить выбранные
+            </button>
+            <button
+              type="button"
+              className="button"
+              disabled={!selectedNotFoundTracks.length || retryBusy}
+              onClick={() => onRetryNotFound({
+                statuses: ["NOT_FOUND"],
+                track_ids: selectedNotFoundTracks.map((track) => track.track_id),
+                search_mode: "balanced",
+                bypass_cache: true,
+                enable_selenium: false,
+                provider_timeout_sec: 8,
+                custom_queries: {},
+              })}
+            >
+              Повторить выбранные без кэша
+            </button>
+            <button
+              type="button"
+              className="button"
+              disabled={!selectedNotFoundTracks.length || retryBusy}
+              onClick={() => onRetryNotFound({
+                statuses: ["NOT_FOUND"],
+                track_ids: selectedNotFoundTracks.map((track) => track.track_id),
+                search_mode: "deep",
+                bypass_cache: true,
+                enable_selenium: true,
+                provider_timeout_sec: 12,
+                custom_queries: {},
+              })}
+            >
+              Повторить выбранные глубоким поиском
             </button>
           </div>
         ) : null}
@@ -2264,8 +2386,12 @@ function ProblemTracksSection({
 
                 {track.provider_summary?.length ? (
                   <p className="manual-review-note">
-                    {track.provider_summary.map((item) => `${item.provider}: ${item.reason || item.status || item.candidate_count || "—"}`).join(" · ")}
+                    {providerSummaryText(track.provider_summary)}
                   </p>
+                ) : null}
+
+                {problemTrackDiagnostics(track).length ? (
+                  <p className="manual-review-note">{problemTrackDiagnostics(track).join(" · ")}</p>
                 ) : null}
 
                 <div className="manual-review-actions">
@@ -2285,8 +2411,9 @@ function ProblemTracksSection({
             )}
           </div>
         ) : (
-          <div className="problem-table" role="table" aria-label="Проблемные треки">
+          <div className={`problem-table${activeTab === "not_found" ? " problem-table-not-found" : ""}`} role="table" aria-label="Проблемные треки">
             <div className="problem-table-head" role="row">
+              {activeTab === "not_found" ? <span>Выбор</span> : null}
               <span>№</span>
               <span>Ожидаемый трек</span>
               <span>Статус</span>
@@ -2297,7 +2424,17 @@ function ProblemTracksSection({
               <span>Действия</span>
             </div>
             {items.length ? items.map((track, rowIndex) => (
-              <div className="problem-table-row" role="row" key={track.track_id || `${track.input_line}-${rowIndex}`}>
+              <div className={`problem-table-row${activeTab === "not_found" ? " problem-table-row-selectable" : ""}`} role="row" key={track.track_id || `${track.input_line}-${rowIndex}`}>
+                {activeTab === "not_found" ? (
+                  <label className="problem-select">
+                    <input
+                      type="checkbox"
+                      checked={selectedNotFoundTrackIds.includes(track.track_id)}
+                      onChange={() => toggleNotFoundTrack(track.track_id)}
+                    />
+                    <span className="sr-only">Выбрать трек {track.input_line}</span>
+                  </label>
+                ) : null}
                 <span>{track.index || rowIndex + 1}</span>
                 <div className="problem-primary">
                   <strong>{track.input_line}</strong>
@@ -2306,7 +2443,8 @@ function ProblemTracksSection({
                 <span>{track.user_status_label || track.status || "—"}</span>
                 <div className="problem-reason">
                   <strong>{problemTrackReason(track)}</strong>
-                  {track.provider_summary?.length ? <small>{track.provider_summary.map((item) => `${item.provider}: ${item.reason || item.status || item.candidate_count || "—"}`).join(" · ")}</small> : null}
+                  {problemTrackDiagnostics(track).length ? <small>{problemTrackDiagnostics(track).join(" · ")}</small> : null}
+                  {track.provider_summary?.length ? <small>{providerSummaryText(track.provider_summary)}</small> : null}
                 </div>
                 <span>{bestCandidateTitle(track)}</span>
                 <span>{typeof track.score === "number" ? track.score.toFixed(2) : "—"}</span>
@@ -2362,6 +2500,7 @@ function ResultsPanel({
   const summary = problemTracks?.summary ?? resolveResultSummary(job, report);
   const ready = job?.download_ready;
   const archiveLabel = summary.total > 0 && summary.accepted === summary.total ? "Архив готов" : "Архив готов частично";
+  const diagnosticHref = job ? `${API_BASE}/api/jobs/${job.job_id}/diagnostic.zip` : "";
 
   return (
     <>
@@ -2394,9 +2533,12 @@ function ResultsPanel({
           </div>
         )}
 
-        {job?.available_reports && job.available_reports.length > 0 && (
+        {job && ((job.available_reports && job.available_reports.length > 0) || job.job_id) && (
           <div className="report-actions">
-            {job.available_reports.map((name) => (
+            <a href={diagnosticHref}>
+              Скачать diagnostic.zip
+            </a>
+            {(job.available_reports ?? []).map((name) => (
               <a key={name} href={`${API_BASE}/api/jobs/${job.job_id}/reports/${name}`}>
                 Скачать {name}
               </a>
@@ -2663,7 +2805,7 @@ export default function App() {
       setLastReport(null);
       setDownloadedJobId(null);
       setJob(data as JobInfo);
-      setStatus("Retry запущен только для не найденных треков.");
+      setStatus("Retry запущен.");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Не удалось запустить retry.");
     } finally {

@@ -44,8 +44,8 @@ mkdir "%RELEASE_DIR%"
 
 echo Copying project files...
 robocopy "%CD%" "%RELEASE_DIR%" /E ^
-    /XD ".git" ".idea" ".venv" ".runtime" "__pycache__" "node_modules" "downloaded_music" "backups" "archive" "release" ^
-    /XF ".env" "*.pyc" "*.pyo" "*.log" >nul
+    /XD ".git" ".idea" ".venv" ".runtime" "__pycache__" "node_modules" "downloaded_music" "backups" "archive" "release" "Lib" "Scripts" "site-packages" ^
+    /XF ".env" "*.pyc" "*.pyo" "*.pyd" "*.log" "pyvenv.cfg" >nul
 
 if %ERRORLEVEL% GEQ 8 (
     echo Failed to copy project files.

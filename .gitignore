@@ -12,14 +12,19 @@ __pycache__/
 .runtime/
 venv/
 env/
+release/
 Lib/
+**/Lib/
 site-packages/
 **/site-packages/
 Scripts/
+**/Scripts/
 pyvenv.cfg
+**/pyvenv.cfg
 
 # Node / frontend
 node_modules/
+**/node_modules/
 dist/
 build/
 .next/

@@ -45,7 +45,6 @@
 - Post-download validation.
 - Отчеты качества и ручной проверки.
 - Итоговый ZIP только из accepted/OK-файлов.
-- CLI-режим и retry по проблемным статусам.
 
 ## Архитектура
 
@@ -57,7 +56,6 @@
 - `web/app.py` — backend API, фоновые задачи, импорт, отчеты, скачивание результата.
 - `frontend/src/App.tsx` — основной frontend dashboard.
 - `frontend/src/App.css` и `frontend/src/index.css` — визуальный слой.
-- `archive/scripts.py` — CLI.
 - `pack_downloads.py` — упаковка результата.
 - `start.bat` — упрощенный запуск проекта на Windows одной командой.
 - `prepare_release.bat` — сборка переносимого ZIP-архива для другого Windows-ПК.
@@ -209,7 +207,7 @@ Frontend уже поддерживает production-сценарий: после
 - HTTP providers запускаются async через `asyncio`/`httpx`;
 - кандидаты дедуплицируются перед quality scoring;
 - quality scoring остается старый (`quality.py`);
-- `downloader_core.py` получает тот же список `quality.TrackCandidate` и дальше сохраняет старый pipeline: validation, reports, accepted-only ZIP, CLI/web flow;
+- `downloader_core.py` получает тот же список `quality.TrackCandidate` и дальше сохраняет старый pipeline: validation, reports, accepted-only ZIP, web flow;
 - Selenium fallback выключен по умолчанию и используется только при `ENABLE_SELENIUM_FALLBACK=true`, `SEARCH_MODE=deep` или UI-режиме `Глубокий поиск`;
 - если HTTP дал хороший/high-confidence результат, Selenium не запускается;
 - `candidates.json` теперь содержит `decision_reason`, provider summary и `from_cache`.
@@ -327,21 +325,6 @@ Selenium-контракт:
 - `POST_DOWNLOAD_OK_SCORE_THRESHOLD=0.80` is intentionally lower than `OK_SCORE_THRESHOLD=0.85`: after a file is downloaded and passes version/duration/file checks, near-exact matches such as `0.83-0.85` should be accepted instead of moved to `rejected/`.
 - UI clears stale failed error messages when a job finishes as `completed` or `partial_success`, and backend clears `current_track` on final job states.
 
-## CLI
-
-CLI находится в `archive/scripts.py`.
-
-Поддерживаются:
-
-- обычный запуск по плейлисту;
-- `--import-playlist`;
-- `--import-playlist ... --run`;
-- `--retry-failed`;
-- `--retry-not-found`;
-- `--retry-suspicious`;
-- `--retry-manual-review`;
-- `--retry-rejected`.
-
 ## Текущий статус
 
 Проект уже умеет:
@@ -355,7 +338,7 @@ CLI находится в `archive/scripts.py`.
 - валидировать скачанные файлы;
 - собирать ZIP только из `accepted/`;
 - создавать расширенные отчеты;
-- запускаться из web и CLI;
+- запускаться из web;
 - запускаться на Windows через `start.bat` с автоматической подготовкой Python/.venv;
 - собираться в переносимый ZIP через `prepare_release.bat`.
 

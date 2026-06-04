@@ -991,7 +991,7 @@ def _search_lmusic_via_input(
     search_url = cfg.lmusic_origin.rstrip("/")
     driver.get(search_url)
     selectors = [
-        "input[placeholder*='РљР°РєСѓСЋ']",
+        "input[placeholder*='Какую']",
         "input[type='search']",
         "form input[type='text']",
         "input[type='text']",

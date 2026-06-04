@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import tempfile
 import unittest
 import zipfile
@@ -9,6 +10,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 import quality
+import web.app as web_app_module
 from web.app import app
 
 
@@ -128,7 +130,11 @@ class ProblemTracksEndpointTests(unittest.TestCase):
         self.assertEqual(weak["title"], "Weak")
         self.assertEqual(weak["decision_reason"], "http_only_selenium_disabled")
         self.assertTrue(weak["from_cache"])
-        self.assertEqual(weak["provider_summary"][0]["provider"], "hitmo:http")
+        self.assertEqual(weak["cache_hit_type"], None)
+        self.assertEqual(weak["provider_summary"][0]["provider"], "Hitmo")
+        self.assertEqual(weak["provider_summary"][0]["candidate_count"], 1)
+        self.assertEqual(weak["provider_summary"][-1]["provider"], "Cache")
+        self.assertEqual(weak["provider_summary"][-1]["cache_hits"], 1)
         self.assertEqual(weak["score"], 0.66)
         self.assertEqual(weak["best_candidate"]["source"], "hitmo:http")
         self.assertEqual(weak["best_candidate"]["display_title"], "Other - Weak")
@@ -257,6 +263,74 @@ class ProblemTracksEndpointTests(unittest.TestCase):
         self.assertEqual(data["track_id"], track_id)
         self.assertEqual(data["input_line"], "Artist - Weak")
         self.assertEqual(data["decision_reason"], "http_only_selenium_disabled")
+        self.assertFalse(data["from_cache"])
+        self.assertEqual(data["provider_summary"], [
+            {
+                "provider": "Hitmo",
+                "enabled": True,
+                "candidate_count": 0,
+                "errors": [],
+                "error_count": 0,
+                "timeout": False,
+                "statuses": [],
+                "cache_hits": 0,
+                "negative_hits": 0,
+                "status": None,
+                "reason": None,
+            },
+            {
+                "provider": "LMusic",
+                "enabled": True,
+                "candidate_count": 0,
+                "errors": [],
+                "error_count": 0,
+                "timeout": False,
+                "statuses": [],
+                "cache_hits": 0,
+                "negative_hits": 0,
+                "status": None,
+                "reason": None,
+            },
+            {
+                "provider": "Zvyki",
+                "enabled": True,
+                "candidate_count": 0,
+                "errors": [],
+                "error_count": 0,
+                "timeout": False,
+                "statuses": [],
+                "cache_hits": 0,
+                "negative_hits": 0,
+                "status": None,
+                "reason": None,
+            },
+            {
+                "provider": "Selenium",
+                "enabled": False,
+                "candidate_count": 0,
+                "errors": [],
+                "error_count": 0,
+                "timeout": False,
+                "statuses": [],
+                "cache_hits": 0,
+                "negative_hits": 0,
+                "status": None,
+                "reason": None,
+            },
+            {
+                "provider": "Cache",
+                "enabled": True,
+                "candidate_count": 0,
+                "errors": [],
+                "error_count": 0,
+                "timeout": False,
+                "statuses": [],
+                "cache_hits": 0,
+                "negative_hits": 0,
+                "status": None,
+                "reason": None,
+            },
+        ])
         self.assertEqual(data["best_candidate"]["score"], 0.66)
         self.assertEqual(len(data["candidates"]), 1)
         self.assertEqual(data["candidates"][0]["source"], "hitmo:http")
@@ -266,6 +340,115 @@ class ProblemTracksEndpointTests(unittest.TestCase):
         self.assertFalse(data["candidates"][0]["can_preview"])
         self.assertTrue(data["candidates"][0]["can_accept"])
         self.assertIsNone(data["candidates"][0]["downloaded_path"])
+
+    def test_diagnostic_zip_collects_available_files_and_generated_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            items = [
+                quality.make_quality_item("Artist - Missing", quality.STATUS_NOT_FOUND, reason="miss"),
+                quality.make_quality_item(
+                    "Artist - Weak",
+                    quality.STATUS_LOW_CONFIDENCE_MATCH,
+                    reason="score below threshold",
+                    selected_candidate=candidate("Other - Weak", 0.66),
+                ),
+            ]
+            candidates_report = [
+                {
+                    "input_track": "Artist - Weak",
+                    "decision_reason": "http_only_selenium_disabled",
+                    "from_cache": True,
+                    "cache_hit_type": "negative",
+                    "skipped_selenium_reason": "selenium_disabled",
+                    "provider_results": [
+                        {
+                            "provider": "hitmo:http",
+                            "status": "MISS",
+                            "reason": "provider miss",
+                            "from_cache": False,
+                            "candidate_count": 0,
+                        }
+                    ],
+                    "candidates": [quality.candidate_to_dict(candidate("Other - Weak", 0.66))],
+                }
+            ]
+            quality.write_quality_reports(root, items, candidates_report, total=2)
+            (root / "run_info.txt").write_text("run info\n", encoding="utf-8")
+            (root / "job.log").write_text("track123\tArtist - Weak\n", encoding="utf-8")
+
+            with TestClient(app) as client:
+                job_id = "job_diagnostic_zip"
+                with app.state.jobs_lock:
+                    app.state.jobs[job_id] = {
+                        "job_id": job_id,
+                        "status": "partial_success",
+                        "phase": "done",
+                        "saved_run": str(root),
+                        "work_root": None,
+                        "file_name": "playlist.txt",
+                        "delivery": "zip",
+                        "total_lines": 2,
+                        "counts": {"ok": 0, "failed": 2, "skipped": 0},
+                        "quality_counts": {},
+                        "run_settings": {"search_mode": "deep", "bypass_cache": True},
+                        "runtime_config": {"enable_selenium_fallback": True, "search_cache_enabled": True},
+                    }
+
+                res = client.get(f"/api/jobs/{job_id}/diagnostic.zip")
+
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.headers["content-type"], "application/zip")
+        with zipfile.ZipFile(io.BytesIO(res.content)) as archive:
+            names = set(archive.namelist())
+            self.assertEqual(
+                names,
+                {
+                    "run_info.txt",
+                    "quality_report.json",
+                    "quality_report.csv",
+                    "manual_review.csv",
+                    "candidates.json",
+                    "downloaded.log",
+                    "not_found.txt",
+                    "problem_tracks.json",
+                    "env_safe.txt",
+                },
+            )
+            self.assertEqual(archive.read("not_found.txt").decode("utf-8"), "Artist - Missing\n")
+            env_text = archive.read("env_safe.txt").decode("utf-8")
+            self.assertIn("safe_environment:", env_text)
+            self.assertIn("runtime_config:", env_text)
+            self.assertIn("run_settings:", env_text)
+            problem = archive.read("problem_tracks.json").decode("utf-8")
+            self.assertIn('"job_id": "job_diagnostic_zip"', problem)
+            self.assertIn('"skipped_selenium_reason": "selenium_disabled"', problem)
+            self.assertIn('"provider": "Hitmo"', problem)
+            self.assertIn('"negative_hits": 1', problem)
+            self.assertEqual(archive.read("downloaded.log").decode("utf-8"), "track123\tArtist - Weak\n")
+
+    def test_diagnostic_zip_works_without_saved_reports(self) -> None:
+        with TestClient(app) as client:
+            job_id = "job_diagnostic_zip_fallback"
+            with app.state.jobs_lock:
+                app.state.jobs[job_id] = {
+                    "job_id": job_id,
+                    "status": "failed",
+                    "phase": "done",
+                    "total_lines": 2,
+                    "counts": {"ok": 0, "failed": 2, "skipped": 0},
+                    "quality_counts": {"not_found": 2},
+                    "report": {"failed": ["Artist - Missing A", "Artist - Missing B"]},
+                    "runtime_config": {"search_cache_enabled": True},
+                }
+
+            res = client.get(f"/api/jobs/{job_id}/diagnostic.zip")
+
+        self.assertEqual(res.status_code, 200)
+        with zipfile.ZipFile(io.BytesIO(res.content)) as archive:
+            names = set(archive.namelist())
+            self.assertEqual(names, {"run_info.txt", "not_found.txt", "problem_tracks.json", "env_safe.txt"})
+            self.assertEqual(archive.read("not_found.txt").decode("utf-8"), "Artist - Missing A\nArtist - Missing B\n")
+            self.assertIn('"manual_review": 0', archive.read("problem_tracks.json").decode("utf-8"))
 
     def test_manual_accept_changes_status(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -586,6 +769,67 @@ class ProblemTracksEndpointTests(unittest.TestCase):
                     self.assertTrue(retry_job["run_settings"]["enable_selenium"])
                     self.assertEqual(retry_job["run_settings"]["provider_timeout_sec"], 12.0)
 
+    def test_retry_supports_additional_problem_statuses(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            items = [
+                quality.make_quality_item("Artist - Missing", quality.STATUS_NOT_FOUND, reason="miss"),
+                quality.make_quality_item("Artist - Broken", quality.STATUS_DOWNLOAD_FAILED, reason="http"),
+                quality.make_quality_item("Artist - Weak", quality.STATUS_LOW_CONFIDENCE_MATCH, reason="weak"),
+                quality.make_quality_item("Artist - Manual", quality.STATUS_NEEDS_MANUAL_REVIEW, reason="manual"),
+                quality.make_quality_item("Artist - Odd", quality.STATUS_SUSPICIOUS_FILE, reason="small"),
+            ]
+            quality.write_quality_reports(root, items, [], total=5)
+            captured: dict[str, object] = {}
+
+            def fake_create_processing_job(_app, clean, file_name, delivery, anon_id, run_settings=None, parent_job_id=None):
+                captured["clean"] = list(clean)
+                captured["run_settings"] = dict(run_settings or {})
+                return web_app_module._new_job_dict(
+                    "job_retry_extra",
+                    file_name,
+                    delivery,
+                    len(clean),
+                    run_settings,
+                    parent_job_id,
+                )
+
+            with patch("web.app._create_processing_job", fake_create_processing_job):
+                with TestClient(app) as client:
+                    parent_job_id = "job_retry_extra_parent"
+                    with app.state.jobs_lock:
+                        app.state.jobs[parent_job_id] = {
+                            "job_id": parent_job_id,
+                            "status": "partial_success",
+                            "phase": "done",
+                            "saved_run": str(root),
+                            "work_root": None,
+                            "delivery": "zip",
+                            "run_settings": {"speed_profile": "fast", "parallel_tasks": "auto"},
+                            "total_lines": 5,
+                            "counts": {"ok": 0, "failed": 5, "skipped": 0},
+                            "quality_counts": {},
+                        }
+
+                    res = client.post(
+                        f"/api/jobs/{parent_job_id}/retry",
+                        json={
+                            "statuses": [
+                                "DOWNLOAD_FAILED",
+                                "LOW_CONFIDENCE_MATCH",
+                                "NEEDS_MANUAL_REVIEW",
+                                "SUSPICIOUS_FILE",
+                            ],
+                            "track_ids": [],
+                        },
+                    )
+
+        self.assertEqual(res.status_code, 202)
+        self.assertEqual(
+            captured["clean"],
+            ["Artist - Broken", "Artist - Weak", "Artist - Manual", "Artist - Odd"],
+        )
+
     def test_retry_not_found_uses_only_not_found_tracks(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -663,6 +907,70 @@ class ProblemTracksEndpointTests(unittest.TestCase):
                     self.assertEqual(res.status_code, 202)
                     retry_job = app.state.jobs[res.json()["job_id"]]
                     self.assertEqual(retry_job["total_lines"], 1)
+
+    def test_retry_uses_custom_query_for_selected_track(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            items = [
+                quality.make_quality_item("Artist - Missing 1", quality.STATUS_NOT_FOUND, reason="miss"),
+                quality.make_quality_item("Artist - Missing 2", quality.STATUS_NOT_FOUND, reason="miss"),
+            ]
+            quality.write_quality_reports(root, items, [], total=2)
+            captured: dict[str, object] = {}
+
+            def fake_create_processing_job(_app, clean, file_name, delivery, anon_id, run_settings=None, parent_job_id=None):
+                captured["clean"] = list(clean)
+                captured["run_settings"] = dict(run_settings or {})
+                return web_app_module._new_job_dict(
+                    "job_retry_custom_query",
+                    file_name,
+                    delivery,
+                    len(clean),
+                    run_settings,
+                    parent_job_id,
+                )
+
+            with patch("web.app._create_processing_job", fake_create_processing_job):
+                with TestClient(app) as client:
+                    parent_job_id = "job_retry_custom_query_parent"
+                    with app.state.jobs_lock:
+                        app.state.jobs[parent_job_id] = {
+                            "job_id": parent_job_id,
+                            "status": "partial_success",
+                            "phase": "done",
+                            "saved_run": str(root),
+                            "work_root": None,
+                            "delivery": "zip",
+                            "run_settings": {"speed_profile": "fast", "parallel_tasks": "auto"},
+                            "total_lines": 2,
+                            "counts": {"ok": 0, "failed": 2, "skipped": 0},
+                            "quality_counts": {},
+                        }
+
+                    problem_tracks = client.get(f"/api/jobs/{parent_job_id}/problem-tracks").json()
+                    selected = problem_tracks["groups"]["not_found"][1]
+
+                    res = client.post(
+                        f"/api/jobs/{parent_job_id}/retry",
+                        json={
+                            "statuses": ["NOT_FOUND"],
+                            "track_ids": [selected["track_id"]],
+                            "custom_queries": {
+                                selected["track_id"]: "Manual Artist - Manual Song",
+                            },
+                        },
+                    )
+
+        self.assertEqual(res.status_code, 202)
+        self.assertEqual(captured["clean"], ["Manual Artist - Manual Song"])
+        self.assertEqual(
+            captured["run_settings"],
+            {
+                "speed_profile": "fast",
+                "parallel_tasks": "auto",
+                "custom_queries": {selected["track_id"]: "Manual Artist - Manual Song"},
+            },
+        )
 
 
 if __name__ == "__main__":
