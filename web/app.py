@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -621,18 +622,36 @@ def _candidate_status(candidate: dict) -> str:
 
 
 def _quality_candidate_from_dict(candidate: dict, input_track: str) -> quality_layer.TrackCandidate:
+    from downloader_core import _display_title_from_download_url, parse_artist_title
+
+    raw_display_title = str(candidate.get("raw_display_title") or candidate.get("raw_title") or "")
+    raw_title = candidate.get("raw_title")
+    raw_artist = candidate.get("raw_artist")
+    download_url = candidate.get("download_url")
+    referer = candidate.get("referer")
+    if (
+        isinstance(download_url, str)
+        and "skysound" in str(candidate.get("provider") or "").lower()
+        and ("skysound" in raw_display_title.lower() or "skysound" in str(raw_title or "").lower())
+    ):
+        cleaned_display = _display_title_from_download_url(download_url, referer)
+        cleaned_artist, cleaned_title = parse_artist_title(cleaned_display)
+        raw_display_title = cleaned_display
+        raw_artist = cleaned_artist or raw_artist
+        raw_title = cleaned_title or raw_title
+
     quality_candidate = quality_layer.TrackCandidate(
         provider=str(candidate.get("provider") or "manual"),
         input_track=input_track,
-        raw_artist=candidate.get("raw_artist"),
-        raw_title=candidate.get("raw_title"),
-        raw_display_title=str(candidate.get("raw_display_title") or candidate.get("raw_title") or ""),
-        normalized_artist=candidate.get("normalized_artist"),
-        normalized_title=candidate.get("normalized_title"),
-        normalized_display_title=str(candidate.get("normalized_display_title") or ""),
+        raw_artist=raw_artist,
+        raw_title=raw_title,
+        raw_display_title=raw_display_title,
+        normalized_artist=quality_layer.normalize_track_text(raw_artist) if raw_artist else candidate.get("normalized_artist"),
+        normalized_title=quality_layer.normalize_track_text(raw_title) if raw_title else candidate.get("normalized_title"),
+        normalized_display_title=quality_layer.normalize_track_text(raw_display_title or ""),
         source_url=candidate.get("source_url"),
-        download_url=candidate.get("download_url"),
-        referer=candidate.get("referer"),
+        download_url=download_url,
+        referer=referer,
         cookie_header=str(candidate.get("cookie_header") or ""),
         search_query=candidate.get("search_query"),
         duration_sec=candidate.get("duration_sec"),
@@ -649,11 +668,64 @@ def _quality_candidate_from_dict(candidate: dict, input_track: str) -> quality_l
     return quality_candidate
 
 
+_LATIN_RE = re.compile(r"[A-Za-z]")
+_CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
+
+
+def _has_latin(text: str) -> bool:
+    return bool(_LATIN_RE.search(text or ""))
+
+
+def _has_cyrillic(text: str) -> bool:
+    return bool(_CYRILLIC_RE.search(text or ""))
+
+
+def _candidate_match_diagnostics(input_line: str, candidate: dict | None) -> list[str]:
+    if not isinstance(candidate, dict):
+        return []
+    notes: list[str] = []
+    score = candidate.get("score")
+    artist_score = candidate.get("artist_score")
+    title_score = candidate.get("title_score")
+    version_score = candidate.get("version_score")
+    version_flags = [str(flag) for flag in (candidate.get("flags") or []) if str(flag)]
+    display_title = str(
+        candidate.get("raw_display_title")
+        or candidate.get("display_title")
+        or candidate.get("raw_title")
+        or ""
+    )
+
+    if isinstance(artist_score, (int, float)) and isinstance(title_score, (int, float)):
+        if artist_score >= 0.8 and title_score < 0.35:
+            notes.append("Исполнитель совпал, но название трека не подтвердилось.")
+        elif title_score < 0.65:
+            notes.append("Название трека совпало неуверенно.")
+        if artist_score < 0.65:
+            notes.append("Исполнитель совпал неуверенно.")
+        if (
+            title_score >= 0.75
+            and artist_score >= 0.75
+            and ((_has_cyrillic(input_line) and _has_latin(display_title)) or (_has_latin(input_line) and _has_cyrillic(display_title)))
+        ):
+            notes.append("Похоже на корректный транслит или латинскую запись.")
+
+    if version_flags and isinstance(version_score, (int, float)) and version_score < 0.72:
+        notes.append(f"У версии есть спорные метки: {', '.join(version_flags[:4])}.")
+
+    if isinstance(score, (int, float)) and score < quality_layer.OK_SCORE_THRESHOLD and not notes:
+        notes.append(
+            f"Общий score ниже порога автопринятия: {float(score):.2f} < {quality_layer.OK_SCORE_THRESHOLD:.2f}."
+        )
+    return notes[:3]
+
+
 def _provider_enabled_map(job: dict | None = None) -> dict[str, bool]:
     runtime = job.get("runtime_config") if isinstance(job, dict) and isinstance(job.get("runtime_config"), dict) else {}
     return {
         "Hitmo": True,
         "LMusic": bool(runtime.get("lmusic_fallback_enabled", True)),
+        "SkySound": bool(runtime.get("skysound_fallback_enabled", True)),
         "Zvyki": bool(runtime.get("zvyki_fallback_enabled", True)),
         "Selenium": bool(runtime.get("enable_selenium_fallback", False)),
         "Cache": bool(runtime.get("search_cache_enabled", True)),
@@ -666,6 +738,8 @@ def _provider_label(raw_provider: str) -> str:
         return "Hitmo"
     if provider.startswith("lmusic:"):
         return "LMusic"
+    if provider.startswith("skysound:"):
+        return "SkySound"
     if provider.startswith("zvyki:"):
         return "Zvyki"
     if provider.startswith("selenium:"):
@@ -746,7 +820,7 @@ def _provider_diagnostics(
         if str(cache_hit_type or "") == "negative":
             cache_bucket["negative_hits"] = 1
     result_list: list[dict] = []
-    for label in ("Hitmo", "LMusic", "Zvyki", "Selenium", "Cache"):
+    for label in ("Hitmo", "LMusic", "SkySound", "Zvyki", "Selenium", "Cache"):
         bucket = out.get(label)
         if not bucket:
             continue
@@ -769,6 +843,7 @@ def _normalized_candidate_payload(
     track_id: str,
     candidate: dict | None,
     *,
+    input_line: str = "",
     candidate_index: int = 1,
     can_accept: bool = False,
 ) -> dict | None:
@@ -783,11 +858,17 @@ def _normalized_candidate_payload(
         "provider": candidate.get("provider"),
         "source": candidate.get("provider"),
         "score": candidate.get("score"),
+        "artist_score": candidate.get("artist_score"),
+        "title_score": candidate.get("title_score"),
+        "duration_score": candidate.get("duration_score"),
+        "version_score": candidate.get("version_score"),
+        "provider_score": candidate.get("provider_score"),
         "duration_sec": candidate.get("duration_sec"),
         "version_flags": flags if isinstance(flags, list) else [],
         "status": _candidate_status(candidate),
         "reject_reason": candidate.get("reject_reason"),
         "decision_reason": candidate.get("decision_reason"),
+        "match_diagnostics": _candidate_match_diagnostics(input_line, candidate),
         "downloaded_path": None,
         "can_preview": False,
         "can_accept": can_accept,
@@ -796,25 +877,27 @@ def _normalized_candidate_payload(
 
 def _best_candidate_payload(track_id: str, item: dict, candidate_entry: dict | None) -> dict | None:
     selected = item.get("selected_candidate") if isinstance(item.get("selected_candidate"), dict) else None
-    normalized_selected = _normalized_candidate_payload(track_id, selected, candidate_index=1)
+    input_line = str(item.get("input_track") or "")
+    normalized_selected = _normalized_candidate_payload(track_id, selected, input_line=input_line, candidate_index=1)
     if normalized_selected:
         return normalized_selected
     if candidate_entry:
         candidates = candidate_entry.get("candidates")
         if isinstance(candidates, list) and candidates and isinstance(candidates[0], dict):
-            return _normalized_candidate_payload(track_id, candidates[0], candidate_index=1)
+            return _normalized_candidate_payload(track_id, candidates[0], input_line=input_line, candidate_index=1)
     return None
 
 
 def _problem_track_candidates(track_id: str, candidate_entry: dict | None) -> list[dict]:
     if not isinstance(candidate_entry, dict):
         return []
+    input_line = str(candidate_entry.get("input_track") or "")
     raw_candidates = candidate_entry.get("candidates")
     if not isinstance(raw_candidates, list):
         return []
     out: list[dict] = []
     for idx, candidate in enumerate(raw_candidates, 1):
-        payload = _normalized_candidate_payload(track_id, candidate, candidate_index=idx)
+        payload = _normalized_candidate_payload(track_id, candidate, input_line=input_line, candidate_index=idx)
         if payload:
             out.append(payload)
     return out
@@ -828,16 +911,29 @@ def _problem_track_candidates_with_raw(
     out: list[tuple[dict, dict]] = []
     raw_candidates = candidate_entry.get("candidates") if isinstance(candidate_entry, dict) else None
     if isinstance(raw_candidates, list):
+        input_line = str(item.get("input_track") or "") if isinstance(item, dict) else ""
         for idx, candidate in enumerate(raw_candidates, 1):
             if not isinstance(candidate, dict):
                 continue
-            payload = _normalized_candidate_payload(track_id, candidate, candidate_index=idx, can_accept=True)
+            payload = _normalized_candidate_payload(
+                track_id,
+                candidate,
+                input_line=input_line,
+                candidate_index=idx,
+                can_accept=True,
+            )
             if payload:
                 out.append((payload, candidate))
     if out:
         return out
     selected = item.get("selected_candidate") if isinstance(item, dict) and isinstance(item.get("selected_candidate"), dict) else None
-    payload = _normalized_candidate_payload(track_id, selected, candidate_index=1, can_accept=True)
+    payload = _normalized_candidate_payload(
+        track_id,
+        selected,
+        input_line=str(item.get("input_track") or "") if isinstance(item, dict) else "",
+        candidate_index=1,
+        can_accept=True,
+    )
     if payload and isinstance(selected, dict):
         out.append((payload, selected))
     return out
@@ -880,6 +976,7 @@ def _problem_track_payload(index: int, item: dict, candidate_entry: dict | None 
         "reason": item.get("reason"),
         "decision_reason": decision_reason,
         "best_candidate": best_candidate,
+        "match_diagnostics": best_candidate.get("match_diagnostics") if isinstance(best_candidate, dict) else [],
         "score": best_candidate.get("score") if isinstance(best_candidate, dict) else None,
         "from_cache": from_cache,
         "cache_hit_type": cache_hit_type,
@@ -1292,6 +1389,7 @@ def _new_job_dict(
         "delivery": delivery,
         "total_lines": total_lines,
         "current_index": 0,
+        "phase2_completed": 0,
         "current_track": None,
         "counts": {"ok": 0, "failed": 0, "skipped": 0},
         "quality_counts": _zero_quality_counts(),
@@ -1339,12 +1437,14 @@ def _job_progress_callback(app: FastAPI, job_id: str):
         quality_counts = dict(job.get("quality_counts") or _zero_quality_counts())
         phase = job.get("phase") or "queued"
         detail = job.get("detail") or ""
+        phase2_completed = int(job.get("phase2_completed") or 0)
 
         if status == "phase1_start":
             phase = "phase1"
             detail = "Фаза 1: поиск ссылок"
         elif status == "phase2_start":
             phase = "phase2"
+            phase2_completed = 0
             detail = "Фаза 2: скачивание файлов"
         elif status in ("work", "resolve"):
             phase = "phase1"
@@ -1356,23 +1456,31 @@ def _job_progress_callback(app: FastAPI, job_id: str):
             phase = "phase2"
             counts["ok"] = int(counts.get("ok") or 0) + 1
             _bump_quality_count(quality_counts, "ok")
+            phase2_completed += 1
             detail = f"Фаза 2: скачано {counts['ok']} из {total}"
         elif status in quality_layer.QUALITY_STATUSES:
             counts["failed"] = int(counts.get("failed") or 0) + 1
             _bump_quality_count(quality_counts, status)
+            if phase == "phase2":
+                phase2_completed += 1
             detail = f"Quality: {status} ({counts['failed']})"
         elif status == "fail":
             counts["failed"] = int(counts.get("failed") or 0) + 1
+            if phase == "phase2":
+                phase2_completed += 1
             detail = (
                 f"{'Фаза 2' if phase == 'phase2' else 'Фаза 1'}: ошибок {counts['failed']}"
             )
+
+        display_index = phase2_completed if phase == "phase2" else i
 
         _job_update(
             app,
             job_id,
             phase=phase,
             detail=detail,
-            current_index=i,
+            current_index=display_index,
+            phase2_completed=phase2_completed,
             total_lines=total,
             current_track=raw or None,
             counts=counts,

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { Dispatch, DragEvent, SetStateAction } from "react";
+import type { CSSProperties, Dispatch, DragEvent, RefObject, SetStateAction } from "react";
 import "./App.css";
 
 const PRODUCT_NAME = "Музыка Свободы";
@@ -192,13 +192,20 @@ type ProblemTrack = {
     provider?: string | null;
     source?: string | null;
     score?: number | null;
+    artist_score?: number | null;
+    title_score?: number | null;
+    duration_score?: number | null;
+    version_score?: number | null;
+    provider_score?: number | null;
     duration_sec?: number | null;
     version_flags?: string[];
     status?: string | null;
     reject_reason?: string | null;
     decision_reason?: string | null;
+    match_diagnostics?: string[];
   } | null;
   score?: number | null;
+  match_diagnostics?: string[];
   from_cache?: boolean | null;
   cache_hit_type?: string | null;
   skipped_selenium_reason?: string | null;
@@ -227,11 +234,17 @@ type TrackCandidate = {
   provider?: string | null;
   source?: string | null;
   score?: number | null;
+  artist_score?: number | null;
+  title_score?: number | null;
+  duration_score?: number | null;
+  version_score?: number | null;
+  provider_score?: number | null;
   duration_sec?: number | null;
   version_flags?: string[];
   status?: string | null;
   reject_reason?: string | null;
   decision_reason?: string | null;
+  match_diagnostics?: string[];
   downloaded_path?: string | null;
   can_preview?: boolean;
   can_accept?: boolean;
@@ -408,8 +421,28 @@ function bestCandidateTitle(track: ProblemTrack) {
   return track.best_candidate?.display_title || track.best_candidate?.title || "—";
 }
 
+function humanDecisionReason(reason?: string | null) {
+  const value = String(reason || "");
+  if (value === "skysound_api_track_page") return "Найден через SkySound";
+  const labels: Record<string, string> = {
+    LOW_CONFIDENCE_MATCH: "Низкая уверенность в совпадении",
+    http_only_selenium_disabled: "Поиск выполнен без Selenium fallback",
+    http_only_not_found_selenium_disabled: "HTTP-поиск не нашёл трек, Selenium был выключен",
+    http_only_selenium_unavailable: "Selenium fallback недоступен",
+    post_download_score_below_ok_threshold: "Трек найден, но итоговая уверенность после скачивания ниже порога",
+    post_download_version_flags: "После скачивания найдена другая версия трека",
+    early_stop_http_high_confidence: "Найден уверенный HTTP-кандидат",
+    hitmo_http_search: "Найден через Hitmo",
+    lmusic_http_best_effort: "Найден через LMusic",
+    zvyki_search_page: "Найден через Zvyki",
+    zvyki_track_page: "Найден на странице трека Zvyki",
+    selenium_fallback: "Найден через Selenium fallback",
+  };
+  return labels[value] || value || "—";
+}
+
 function problemTrackReason(track: ProblemTrack) {
-  return track.reason || track.decision_reason || "—";
+  return humanDecisionReason(track.reason || track.decision_reason);
 }
 
 function cacheLabel(value?: boolean | null) {
@@ -442,8 +475,11 @@ function providerSummaryText(summary?: ProblemTrack["provider_summary"]) {
     .join(" · ");
 }
 
-function problemTrackDiagnostics(track: Pick<ProblemTrack, "from_cache" | "provider_errors" | "skipped_selenium_reason" | "decision_reason" | "provider_summary">) {
+function problemTrackDiagnostics(track: Pick<ProblemTrack, "from_cache" | "provider_errors" | "skipped_selenium_reason" | "decision_reason" | "provider_summary" | "match_diagnostics" | "best_candidate">) {
   const parts: string[] = [];
+  if (track.match_diagnostics?.length) {
+    parts.push(...track.match_diagnostics);
+  }
   if (track.from_cache != null) {
     parts.push(`Кэш: ${cacheLabel(track.from_cache)}`);
   }
@@ -452,10 +488,19 @@ function problemTrackDiagnostics(track: Pick<ProblemTrack, "from_cache" | "provi
     parts.push(`Ошибки провайдеров: ${providerError}`);
   }
   if (track.skipped_selenium_reason) {
-    parts.push(`Selenium: ${track.skipped_selenium_reason}`);
+    parts.push(`Selenium: ${humanDecisionReason(track.skipped_selenium_reason)}`);
   }
   if (track.decision_reason) {
-    parts.push(`Decision: ${track.decision_reason}`);
+    parts.push(`Decision: ${humanDecisionReason(track.decision_reason)}`);
+  }
+  if (track.best_candidate && (typeof track.best_candidate.artist_score === "number" || typeof track.best_candidate.title_score === "number")) {
+    const scoreBits: string[] = [];
+    if (typeof track.best_candidate.artist_score === "number") scoreBits.push(`artist ${track.best_candidate.artist_score.toFixed(2)}`);
+    if (typeof track.best_candidate.title_score === "number") scoreBits.push(`title ${track.best_candidate.title_score.toFixed(2)}`);
+    if (typeof track.best_candidate.version_score === "number") scoreBits.push(`version ${track.best_candidate.version_score.toFixed(2)}`);
+    if (scoreBits.length) {
+      parts.push(`Score parts: ${scoreBits.join(", ")}`);
+    }
   }
   if (!parts.length && track.provider_summary?.length) {
     parts.push(providerSummaryText(track.provider_summary));
@@ -492,7 +537,7 @@ function progressPercent(job: JobInfo | null) {
   if (!job) return 0;
   const total = job.total_lines ?? 0;
   if (!total) return 0;
-  if (job.status === "completed" || job.status === "partial_success" || job.status === "failed") {
+  if (job.status === "completed") {
     return 100;
   }
   const current = Math.max(0, Math.min(job.current_index ?? 0, total));
@@ -1054,6 +1099,7 @@ function PlaylistPreviewCard({
   importTab,
   playlistDraft,
   setPlaylistDraft,
+  previewCardHeight,
 }: {
   importResult: ImportResponse | null;
   importContent: string;
@@ -1063,6 +1109,7 @@ function PlaylistPreviewCard({
   importTab: ImportTab;
   playlistDraft: PreviewTrackRow[] | null;
   setPlaylistDraft: Dispatch<SetStateAction<PreviewTrackRow[] | null>>;
+  previewCardHeight: number | null;
 }) {
   const [openMenuIndex, setOpenMenuIndex] = useState<number | null>(null);
   const [lastRemovedTrack, setLastRemovedTrack] = useState<{ track: PreviewTrackRow; index: number } | null>(null);
@@ -1167,8 +1214,15 @@ function PlaylistPreviewCard({
     }
   }, []);
 
+  const previewCardStyle = useMemo<CSSProperties | undefined>(() => {
+    if (!previewCardHeight) return undefined;
+    return {
+      ["--preview-card-height" as string]: `${previewCardHeight}px`,
+    } as CSSProperties;
+  }, [previewCardHeight]);
+
   return (
-    <section className="card preview-card">
+    <section className="card preview-card" data-preview-card style={previewCardStyle}>
       <div className="card-head">
         <div>
           <p className="card-kicker">Проверка перед стартом</p>
@@ -1189,7 +1243,7 @@ function PlaylistPreviewCard({
             Убрать дубли
           </button>
         </div>
-        <div className="track-list">
+        <div className="track-list" data-preview-list>
           {preview.map((track, index) => (
             <div className="track-row" key={`${track.line}-${index}`}>
               <div className="cover-placeholder">
@@ -1284,6 +1338,7 @@ function ArchiveSettingsCard({
   importing,
   hasImportInput,
   submitImport,
+  archiveCardRef,
 }: {
   delivery: "zip" | "tracks";
   setDelivery: (delivery: "zip" | "tracks") => void;
@@ -1297,6 +1352,7 @@ function ArchiveSettingsCard({
   importing: boolean;
   hasImportInput: boolean;
   submitImport: (runNow: boolean) => Promise<void>;
+  archiveCardRef: RefObject<HTMLElement | null>;
 }) {
   const speedProfiles: Array<{ value: SpeedProfile; label: string; hint: string }> = [
     { value: "fast", label: "Быстро", hint: "HTTP без Chrome" },
@@ -1307,7 +1363,7 @@ function ArchiveSettingsCard({
   const activeRuntime = resolveRuntimePreview(runtimeConfig, speedProfile, parallelTasks);
 
   return (
-    <section className="card archive-card" id="archive-settings">
+    <section className="card archive-card" id="archive-settings" data-archive-card ref={archiveCardRef}>
       <div className="card-head">
         <div>
           <p className="card-kicker">Финальный пакет</p>
@@ -1658,6 +1714,7 @@ function ProgressCard({ job }: { job: JobInfo | null }) {
   const elapsedMs = startedAt ? Math.max(0, (job?.status === "completed" || job?.status === "partial_success" || job?.status === "failed" ? (updatedAt ?? now) : now) - startedAt) : null;
   const etaMs = elapsedMs && current > 0 && total > current ? (elapsedMs / current) * (total - current) : null;
   const isSearchPhase = job?.phase === "phase1";
+  const isDownloadPhase = job?.phase === "phase2";
   const foundCount = !isSearchPhase && total > 0 && quality?.not_found != null ? Math.max(0, total - quality.not_found) : null;
   const downloadedCount = quality?.downloaded_ok ?? job?.counts?.ok ?? null;
   const rejectedCount =
@@ -1706,7 +1763,7 @@ function ProgressCard({ job }: { job: JobInfo | null }) {
           <dd>{total || "—"}</dd>
         </div>
         <div>
-          <dt>{isSearchPhase ? "Проверено" : "Готово"}</dt>
+          <dt>{isSearchPhase ? "Проверено" : isDownloadPhase ? "Скачано" : "Готово"}</dt>
           <dd>{current} / {total}</dd>
         </div>
         <div>
@@ -1715,7 +1772,7 @@ function ProgressCard({ job }: { job: JobInfo | null }) {
         </div>
         <div>
           <dt>Скачано</dt>
-          <dd>{downloadedCount ?? "—"}</dd>
+          <dd>{isDownloadPhase ? `${current} / ${total}` : downloadedCount ?? "—"}</dd>
         </div>
         <div>
           <dt>Не найдено</dt>
@@ -1909,7 +1966,7 @@ function CandidateInspectorModal({
                   </div>
                   <div>
                     <dt>Decision</dt>
-                    <dd>{candidate.decision_reason || "—"}</dd>
+                    <dd>{humanDecisionReason(candidate.decision_reason) || "—"}</dd>
                   </div>
                   <div>
                     <dt>Reject reason</dt>
@@ -2062,6 +2119,16 @@ function ProblemTracksSection({
     );
   }
 
+  function toggleAllManualTracks() {
+    const manualTrackIds = (groups.manual_review ?? []).map((track) => track.track_id);
+    setSelectedManualTrackIds((current) => (current.length === manualTrackIds.length ? [] : manualTrackIds));
+  }
+
+  function toggleAllNotFoundTracks() {
+    const notFoundTrackIds = (groups.not_found ?? []).map((track) => track.track_id);
+    setSelectedNotFoundTrackIds((current) => (current.length === notFoundTrackIds.length ? [] : notFoundTrackIds));
+  }
+
   async function handleCandidateAccept(track: ProblemTrack, candidate: TrackCandidate) {
     if (!candidate.candidate_id) return;
     setManualActionBusy(true);
@@ -2182,6 +2249,9 @@ function ProblemTracksSection({
             <button type="button" className="button" onClick={() => setShowList((value) => !value)} disabled={!notFoundItems.length}>
               {showList ? "Скрыть список" : "Показать список"}
             </button>
+            <button type="button" className="button" onClick={toggleAllNotFoundTracks} disabled={!notFoundItems.length}>
+              {selectedNotFoundTrackIds.length === notFoundItems.length ? "Снять выбор" : "Выбрать все"}
+            </button>
             <button type="button" className="button" onClick={() => void copyText(notFoundListText)} disabled={!notFoundItems.length}>
               Скопировать список
             </button>
@@ -2298,6 +2368,9 @@ function ProblemTracksSection({
             <button type="button" className="button" onClick={() => setShowList((value) => !value)} disabled={!items.length}>
               {showList ? "Скрыть список" : "Показать список"}
             </button>
+            <button type="button" className="button" onClick={toggleAllManualTracks} disabled={!items.length}>
+              {selectedManualTrackIds.length === items.length ? "Снять выбор" : "Выбрать все"}
+            </button>
             <button
               type="button"
               className="button"
@@ -2380,7 +2453,7 @@ function ProblemTracksSection({
                   </div>
                   <div>
                     <dt>Decision reason</dt>
-                    <dd>{track.decision_reason || track.best_candidate?.decision_reason || "—"}</dd>
+                    <dd>{humanDecisionReason(track.decision_reason || track.best_candidate?.decision_reason) || "—"}</dd>
                   </div>
                 </dl>
 
@@ -2586,7 +2659,9 @@ export default function App() {
   const [importing, setImporting] = useState(false);
   const [importResult, setImportResult] = useState<ImportResponse | null>(null);
   const [playlistDraft, setPlaylistDraft] = useState<PreviewTrackRow[] | null>(null);
+  const [previewCardHeight, setPreviewCardHeight] = useState<number | null>(null);
   const [activeModal, setActiveModal] = useState<AppModal>(null);
+  const archiveCardRef = useRef<HTMLElement | null>(null);
   const [qualitySettings, setQualitySettings] = useState<QualitySettings>({
     preferOriginal: true,
     preferExplicit: true,
@@ -2884,6 +2959,31 @@ export default function App() {
 
   const activeImportHasInput = importTab === "file" ? Boolean(importFile) : Boolean(importContent.trim());
 
+  useEffect(() => {
+    const updatePreviewHeight = () => {
+      if (window.innerWidth <= 1180) {
+        setPreviewCardHeight(null);
+        return;
+      }
+      const archiveCard = archiveCardRef.current;
+      if (!archiveCard) return;
+      const nextHeight = Math.ceil(archiveCard.getBoundingClientRect().height);
+      setPreviewCardHeight((current) => (current === nextHeight ? current : nextHeight));
+    };
+
+    updatePreviewHeight();
+
+    const archiveCard = archiveCardRef.current;
+    const observer = archiveCard ? new ResizeObserver(() => updatePreviewHeight()) : null;
+    if (archiveCard && observer) observer.observe(archiveCard);
+    window.addEventListener("resize", updatePreviewHeight);
+
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", updatePreviewHeight);
+    };
+  }, []);
+
   const handleImportTabChange = useCallback((nextTab: ImportTab) => {
     setImportTab(nextTab);
     setImportResult(null);
@@ -3010,6 +3110,7 @@ export default function App() {
             importTab={importTab}
             playlistDraft={playlistDraft}
             setPlaylistDraft={setPlaylistDraft}
+            previewCardHeight={previewCardHeight}
           />
           <ArchiveSettingsCard
             delivery={delivery}
@@ -3024,6 +3125,7 @@ export default function App() {
             importing={importing}
             hasImportInput={hasImportInput}
             submitImport={submitImport}
+            archiveCardRef={archiveCardRef}
           />
           <ProgressCard job={job} />
         </section>

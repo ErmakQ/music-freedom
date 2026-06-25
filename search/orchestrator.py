@@ -186,35 +186,43 @@ class SearchOrchestrator:
         best = decision.candidates[0]
         if getattr(best, "hard_reject", False):
             return False
-        usable = [
-            candidate
-            for candidate in decision.candidates
-            if not getattr(candidate, "hard_reject", False)
-            and float(getattr(candidate, "score", 0.0) or 0.0) >= quality_layer.LOW_CONFIDENCE_THRESHOLD
-        ]
-        return (
-            len(usable) >= self.early_stop_min_candidates
-            or float(getattr(best, "score", 0.0) or 0.0) >= quality_layer.OK_SCORE_THRESHOLD
-        )
+        return float(getattr(best, "score", 0.0) or 0.0) >= quality_layer.OK_SCORE_THRESHOLD
 
     def _decision_from_cached(self, track: TrackQuery, payload: dict) -> SearchDecision:
+        from downloader_core import _display_title_from_download_url, parse_artist_title
+
         candidates = []
         for candidate in payload.get("candidates", []):
             if not isinstance(candidate, dict) or not candidate.get("download_url"):
                 continue
+            raw_display_title = candidate.get("raw_display_title") or ""
+            raw_title = candidate.get("raw_title")
+            raw_artist = candidate.get("raw_artist")
+            download_url = candidate.get("download_url")
+            referer = candidate.get("referer")
+            if (
+                isinstance(download_url, str)
+                and "skysound" in str(candidate.get("provider") or "").lower()
+                and ("skysound" in str(raw_display_title).lower() or "skysound" in str(raw_title or "").lower())
+            ):
+                cleaned_display = _display_title_from_download_url(download_url, referer)
+                cleaned_artist, cleaned_title = parse_artist_title(cleaned_display)
+                raw_display_title = cleaned_display
+                raw_artist = cleaned_artist or raw_artist
+                raw_title = cleaned_title or raw_title
             q = quality_layer.TrackCandidate(
                 provider=candidate.get("provider") or "cache",
                 input_track=candidate.get("input_track") or track.raw,
-                raw_artist=candidate.get("raw_artist"),
-                raw_title=candidate.get("raw_title"),
-                raw_display_title=candidate.get("raw_display_title") or "",
+                raw_artist=raw_artist,
+                raw_title=raw_title,
+                raw_display_title=raw_display_title,
                 duration_sec=candidate.get("duration_sec") or track.expected_duration_sec,
-                normalized_artist=candidate.get("normalized_artist"),
-                normalized_title=candidate.get("normalized_title"),
-                normalized_display_title=candidate.get("normalized_display_title") or "",
+                normalized_artist=quality_layer.normalize_track_text(raw_artist) if raw_artist else candidate.get("normalized_artist"),
+                normalized_title=quality_layer.normalize_track_text(raw_title) if raw_title else candidate.get("normalized_title"),
+                normalized_display_title=quality_layer.normalize_track_text(raw_display_title or ""),
                 source_url=candidate.get("source_url"),
-                download_url=candidate.get("download_url"),
-                referer=candidate.get("referer"),
+                download_url=download_url,
+                referer=referer,
                 cookie_header=candidate.get("cookie_header") or "",
                 search_query=candidate.get("search_query"),
             )

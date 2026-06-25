@@ -8,6 +8,7 @@ import urllib.parse
 from typing import Any
 
 import httpx
+import quality as quality_layer
 
 from .base import ProviderBase
 from .models import ProviderResult, SearchCandidate, TrackQuery
@@ -53,6 +54,93 @@ def _candidate_from_attempt(
         raw_display_title=display,
         decision_reason=decision_reason,
     )
+
+
+def _rank_candidates_for_track(track: TrackQuery, candidates: list[SearchCandidate]) -> list[SearchCandidate]:
+    ranked: list[SearchCandidate] = []
+    for candidate in candidates:
+        quality_candidate = quality_layer.TrackCandidate(
+            provider=candidate.provider,
+            input_track=track.raw,
+            raw_artist=candidate.raw_artist,
+            raw_title=candidate.raw_title,
+            raw_display_title=candidate.raw_display_title or "",
+            source_url=candidate.source_url,
+            download_url=candidate.download_url,
+            referer=candidate.referer,
+            cookie_header=candidate.cookie_header,
+            search_query=candidate.search_query,
+        )
+        score = quality_layer.score_candidate(track.raw, quality_candidate)
+        candidate.score = score.final_score
+        candidate.flags = score.flags
+        candidate.hard_reject = score.hard_reject
+        candidate.reject_reason = score.reason
+        ranked.append(candidate)
+    return sorted(
+        ranked,
+        key=lambda candidate: (
+            0 if candidate.hard_reject else 1,
+            float(candidate.score or 0.0),
+            1 if candidate.raw_artist or candidate.raw_title else 0,
+        ),
+        reverse=True,
+    )
+
+
+def _selenium_query_budget(track: TrackQuery) -> list[str]:
+    mode = str(track.cache_context.get("search_mode") or "").strip().lower()
+    limit = 4 if mode == "deep" else 6
+    base: list[str] = []
+    suffix: list[str] = []
+    seen: set[str] = set()
+    suffix_markers = (
+        " explicit",
+        " uncensored",
+        " original",
+        " full version",
+        " album version",
+    )
+    for query in track.generated_queries:
+        normalized = " ".join(str(query or "").split())
+        if not normalized:
+            continue
+        folded = normalized.casefold()
+        if folded in seen:
+            continue
+        seen.add(folded)
+        if folded.endswith(suffix_markers):
+            suffix.append(normalized)
+        else:
+            base.append(normalized)
+    combined = base + suffix
+    return combined[:limit]
+
+
+def _extract_skysound_track_urls(html: str) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    pattern = re.compile(r'href=["\'](https?://[^"\']+\.skysound7\.com/t/[^"\']+)["\']', re.I)
+    for match in pattern.finditer(html or ""):
+        url = match.group(1).split("#", 1)[0].rstrip("/")
+        if url in seen:
+            continue
+        seen.add(url)
+        out.append(url)
+    return out
+
+
+def _extract_skysound_download_urls(html: str) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    pattern = re.compile(r'https://fine\.sunproxy\.net/file/[^"\']+?\.mp3', re.I)
+    for match in pattern.finditer(html or ""):
+        url = match.group(0).rstrip(").,;\"'")
+        if url in seen:
+            continue
+        seen.add(url)
+        out.append(url)
+    return out
 
 
 class HitmoHTTPProvider(ProviderBase):
@@ -115,9 +203,8 @@ class HitmoHTTPProvider(ProviderBase):
                             decision_reason="hitmo_http_search",
                         )
                     )
-                if len(candidates) >= 5:
-                    break
-            return ProviderResult(self.name, candidates, reason=None if candidates else "miss")
+            ranked = _rank_candidates_for_track(track, candidates)
+            return ProviderResult(self.name, ranked[:5], reason=None if ranked else "miss")
         finally:
             if own_client:
                 await client.aclose()
@@ -190,8 +277,6 @@ class ZvykiHTTPProvider(ProviderBase):
                                         decision_reason="zvyki_track_page",
                                     )
                                 )
-                                if len(candidates) >= 5:
-                                    return ProviderResult(self.name, candidates)
                     else:
                         audio_urls.sort(
                             key=lambda u: score_mp3_url_path(u, track.raw, track.artist, track.title),
@@ -212,9 +297,8 @@ class ZvykiHTTPProvider(ProviderBase):
                                     decision_reason="zvyki_search_page",
                                 )
                             )
-                    if candidates:
-                        return ProviderResult(self.name, candidates)
-            return ProviderResult(self.name, candidates, reason=None if candidates else "miss")
+            ranked = _rank_candidates_for_track(track, candidates)
+            return ProviderResult(self.name, ranked[:5], reason=None if ranked else "miss")
         finally:
             if own_client:
                 await client.aclose()
@@ -280,9 +364,103 @@ class LMusicHTTPProvider(ProviderBase):
                         if (candidate.raw_display_title or "").strip().lower() in {"track", "download", "file", "audio"}:
                             continue
                         candidates.append(candidate)
-                    if candidates:
-                        return ProviderResult(self.name, candidates)
-            return ProviderResult(self.name, candidates, reason=None if candidates else "miss")
+            ranked = _rank_candidates_for_track(track, candidates)
+            return ProviderResult(self.name, ranked[:5], reason=None if ranked else "miss")
+        finally:
+            if own_client:
+                await client.aclose()
+
+
+class SkySoundHTTPProvider(ProviderBase):
+    name = "skysound:http"
+
+    def __init__(self, cfg: Any, client: httpx.AsyncClient | None = None) -> None:
+        self.cfg = cfg
+        self.client = client
+
+    async def search(self, track: TrackQuery) -> ProviderResult:
+        if not getattr(self.cfg, "skysound_fallback_enabled", True):
+            return ProviderResult(self.name, [], status="DISABLED", reason="disabled")
+
+        from downloader_core import score_mp3_url_path
+
+        headers = {
+            "User-Agent": self.cfg.chrome_ua,
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": self.cfg.skysound_origin.rstrip("/") + "/",
+        }
+        page_headers = {
+            "User-Agent": self.cfg.chrome_ua,
+            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        }
+        api_url = f"{self.cfg.skysound_origin.rstrip('/')}/api/search"
+        own_client = self.client is None
+        client = self.client or httpx.AsyncClient(timeout=self.cfg.provider_timeout_sec, follow_redirects=True)
+        candidates: list[SearchCandidate] = []
+        seen_pages: set[str] = set()
+        seen_urls: set[str] = set()
+        try:
+            for query in track.generated_queries[:3]:
+                landing_url = ""
+                try:
+                    resp = await client.get(api_url, params={"query": query}, headers=headers)
+                    resp.raise_for_status()
+                    payload = resp.json()
+                    if isinstance(payload, dict):
+                        landing_url = str(payload.get("url") or "").strip()
+                except Exception as exc:
+                    log.debug("SkySound API miss %s: %s", query, exc)
+                    continue
+                if not landing_url:
+                    continue
+                try:
+                    page_resp = await client.get(landing_url, headers=page_headers)
+                    page_resp.raise_for_status()
+                except Exception as exc:
+                    log.debug("SkySound page miss %s: %s", landing_url, exc)
+                    continue
+                page_html = _decode_response_text(page_resp)
+                track_urls = _extract_skysound_track_urls(page_html)
+                if "/t/" in str(page_resp.url):
+                    track_urls.insert(0, str(page_resp.url).rstrip("/"))
+                track_urls = sorted(
+                    {url for url in track_urls if url},
+                    key=lambda u: score_mp3_url_path(u, track.raw, track.artist, track.title),
+                    reverse=True,
+                )
+                for track_url in track_urls[:5]:
+                    if track_url in seen_pages:
+                        continue
+                    seen_pages.add(track_url)
+                    try:
+                        track_resp = await client.get(track_url, headers=page_headers)
+                        track_resp.raise_for_status()
+                    except Exception:
+                        continue
+                    track_html = _decode_response_text(track_resp)
+                    download_urls = _extract_skysound_download_urls(track_html)
+                    download_urls.sort(
+                        key=lambda u: score_mp3_url_path(u, track.raw, track.artist, track.title),
+                        reverse=True,
+                    )
+                    for download_url in download_urls[:3]:
+                        if download_url in seen_urls:
+                            continue
+                        seen_urls.add(download_url)
+                        candidates.append(
+                            _candidate_from_attempt(
+                                self.name,
+                                track,
+                                query,
+                                (download_url, str(track_resp.url), ""),
+                                decision_reason="skysound_api_track_page",
+                            )
+                        )
+            ranked = _rank_candidates_for_track(track, candidates)
+            return ProviderResult(self.name, ranked[:5], reason=None if ranked else "miss")
         finally:
             if own_client:
                 await client.aclose()
@@ -302,7 +480,7 @@ class SeleniumFallbackProvider(ProviderBase):
 
             candidates: list[SearchCandidate] = []
             seen: set[str] = set()
-            for query in track.generated_queries:
+            for query in _selenium_query_budget(track):
                 attempts = _find_plan_via_selenium(
                     self.driver,
                     self.wait,

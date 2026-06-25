@@ -6,12 +6,13 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from downloader_core import DEFAULT_LMUSIC_ORIGIN, DEFAULT_SITE_ORIGIN, DEFAULT_ZVYKI_ORIGIN, DownloadConfig
+from downloader_core import DEFAULT_LMUSIC_ORIGIN, DEFAULT_SITE_ORIGIN, DEFAULT_SKYSOUND_ORIGIN, DEFAULT_ZVYKI_ORIGIN, DownloadConfig
 
 
 def load_download_config_from_env() -> DownloadConfig:
     site_origin = os.environ.get("SITE_ORIGIN", DEFAULT_SITE_ORIGIN).strip() or DEFAULT_SITE_ORIGIN
     lmusic_origin = os.environ.get("LMUSIC_ORIGIN", DEFAULT_LMUSIC_ORIGIN).strip() or DEFAULT_LMUSIC_ORIGIN
+    skysound_origin = os.environ.get("SKYSOUND_ORIGIN", DEFAULT_SKYSOUND_ORIGIN).strip() or DEFAULT_SKYSOUND_ORIGIN
     zvyki_origin = os.environ.get("ZVYKI_ORIGIN", DEFAULT_ZVYKI_ORIGIN).strip() or DEFAULT_ZVYKI_ORIGIN
     lmusic_fallback = os.environ.get("LMUSIC_FALLBACK_ENABLED", "1").strip().lower() not in (
         "0",
@@ -19,6 +20,11 @@ def load_download_config_from_env() -> DownloadConfig:
         "no",
     )
     zvyki_fallback = os.environ.get("ZVYKI_FALLBACK_ENABLED", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+    skysound_fallback = os.environ.get("SKYSOUND_FALLBACK_ENABLED", "1").strip().lower() not in (
         "0",
         "false",
         "no",
@@ -86,6 +92,7 @@ def load_download_config_from_env() -> DownloadConfig:
     return DownloadConfig(
         site_origin=site_origin,
         lmusic_origin=lmusic_origin,
+        skysound_origin=skysound_origin,
         zvyki_origin=zvyki_origin,
         headless=headless,
         wait_sec=wait_sec,
@@ -110,5 +117,6 @@ def load_download_config_from_env() -> DownloadConfig:
         bypass_negative_cache_for_deep=bypass_negative_cache_for_deep,
         search_cache_path=cache_path,
         lmusic_fallback_enabled=lmusic_fallback,
+        skysound_fallback_enabled=skysound_fallback,
         zvyki_fallback_enabled=zvyki_fallback,
     )

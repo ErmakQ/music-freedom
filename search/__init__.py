@@ -11,6 +11,7 @@ __all__ = [
     "SearchDecision",
     "SearchOrchestrator",
     "SeleniumFallbackProvider",
+    "SkySoundHTTPProvider",
     "TrackQuery",
     "ZvykiHTTPProvider",
 ]
@@ -21,6 +22,7 @@ def __getattr__(name: str):
         "HitmoHTTPProvider",
         "LMusicHTTPProvider",
         "SeleniumFallbackProvider",
+        "SkySoundHTTPProvider",
         "ZvykiHTTPProvider",
     }:
         from . import providers

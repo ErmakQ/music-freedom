@@ -9,12 +9,13 @@ from unittest.mock import patch
 
 import quality
 from download_service import load_download_config_from_env
-from downloader_core import DownloadConfig, _candidate_report_entry, run_playlist_download
+from downloader_core import DownloadConfig, _candidate_report_entry, _effective_selenium_wait_sec, run_playlist_download
 import downloader_core
 from search.base import ProviderBase
 from search.cache import SearchCache
 from search.models import ProviderResult, SearchCandidate, TrackQuery
 from search.orchestrator import SearchOrchestrator
+from search.providers import SeleniumFallbackProvider
 
 
 def track_query(raw: str = "Artist - Song") -> TrackQuery:
@@ -173,6 +174,14 @@ class SearchLayerContractTests(unittest.TestCase):
         self.assertEqual(cfg.negative_cache_ttl_hours, 12)
         self.assertTrue(cfg.bypass_negative_cache_for_deep)
 
+    def test_effective_selenium_wait_respects_provider_timeout(self) -> None:
+        cfg = DownloadConfig(wait_sec=18, provider_timeout_sec=12.0)
+        self.assertEqual(_effective_selenium_wait_sec(cfg), 12)
+
+    def test_effective_selenium_wait_does_not_drop_below_minimum(self) -> None:
+        cfg = DownloadConfig(wait_sec=18, provider_timeout_sec=3.0)
+        self.assertEqual(_effective_selenium_wait_sec(cfg), 5)
+
     def test_cache_hit_skips_providers(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             cache = SearchCache(Path(td) / "search.sqlite3", enabled=True)
@@ -233,6 +242,43 @@ class SearchLayerContractTests(unittest.TestCase):
         self.assertEqual(selenium.calls, 0)
         self.assertIsNone(decision.status)
         self.assertGreaterEqual(decision.candidates[0].score, quality.OK_SCORE_THRESHOLD)
+
+    def test_selenium_fallback_limits_deep_query_count(self) -> None:
+        cfg = DownloadConfig(search_mode="deep", enable_selenium_fallback=True)
+        track = TrackQuery(
+            raw="Artist - Song",
+            artist="Artist",
+            title="Song",
+            generated_queries=[
+                "Artist - Song",
+                "artist song",
+                "song artist",
+                "artist song explicit",
+                "artist song uncensored",
+                "artist song original",
+            ],
+            requested_flags=[],
+            cache_context={"search_mode": "deep"},
+        )
+        hitmo_calls: list[str] = []
+        lmusic_calls: list[str] = []
+
+        def fake_hitmo(driver, wait, cfg, raw_song_query, song_query):
+            hitmo_calls.append(song_query)
+            return []
+
+        def fake_lmusic(driver, wait, cfg, raw_song_query, song_query):
+            lmusic_calls.append(song_query)
+            return []
+
+        with patch("downloader_core._find_plan_via_selenium", side_effect=fake_hitmo):
+            with patch("downloader_core._find_lmusic_plan_via_selenium", side_effect=fake_lmusic):
+                provider = SeleniumFallbackProvider(cfg, object(), object())
+                result = asyncio.run(provider.search(track))
+
+        self.assertEqual(result.reason, "miss")
+        self.assertEqual(hitmo_calls, ["Artist - Song", "artist song", "song artist", "artist song explicit"])
+        self.assertEqual(lmusic_calls, hitmo_calls)
 
     def test_weak_candidate_count_does_not_block_selenium(self) -> None:
         weak_candidates = []

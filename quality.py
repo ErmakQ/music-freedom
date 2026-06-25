@@ -70,6 +70,7 @@ NEGATIVE_VERSION_FLAGS = {
     "cover",
     "acoustic",
     "demo",
+    "bassboost",
 }
 
 POSITIVE_VERSION_FLAGS = {
@@ -105,6 +106,11 @@ class TrackCandidate:
     file_size: int | None = None
     bitrate: int | None = None
     score: float = 0.0
+    artist_score: float | None = None
+    title_score: float | None = None
+    duration_score: float | None = None
+    version_score: float | None = None
+    provider_score: float | None = None
     flags: list[str] = field(default_factory=list)
     hard_reject: bool = False
     reject_reason: str | None = None
@@ -161,6 +167,101 @@ def normalize_track_text(text: str) -> str:
     return text
 
 
+_CYRILLIC_TO_LATIN = {
+    "а": "a",
+    "б": "b",
+    "в": "v",
+    "г": "g",
+    "д": "d",
+    "е": "e",
+    "ё": "e",
+    "ж": "zh",
+    "з": "z",
+    "и": "i",
+    "й": "i",
+    "к": "k",
+    "л": "l",
+    "м": "m",
+    "н": "n",
+    "о": "o",
+    "п": "p",
+    "р": "r",
+    "с": "s",
+    "т": "t",
+    "у": "u",
+    "ф": "f",
+    "х": "kh",
+    "ц": "ts",
+    "ч": "ch",
+    "ш": "sh",
+    "щ": "shch",
+    "ъ": "",
+    "ы": "y",
+    "ь": "",
+    "э": "e",
+    "ю": "yu",
+    "я": "ya",
+}
+
+
+def normalize_track_text(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text or "")
+    text = text.translate(_DASHES)
+    text = text.translate(_QUOTES)
+    text = text.translate(_DQUOTES)
+    text = _strip_accents(text)
+    text = text.casefold().replace("ё", "е")
+    text = re.sub(r"\b(featuring|feat\.?|ft\.?)\b", " feat ", text, flags=re.I)
+    text = re.sub(r"\s*&\s*", " and ", text)
+    text = re.sub(r"\bРё\b", " and ", text)
+    text = re.sub(r"[\[\]{}()<>\"'.,:;!?/\\|+_=~]", " ", text)
+    text = re.sub(r"[-]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _latinize_track_text(text: str) -> str:
+    normalized = normalize_track_text(text)
+    out: list[str] = []
+    for ch in normalized:
+        out.append(_CYRILLIC_TO_LATIN.get(ch, ch))
+    return re.sub(r"\s+", " ", "".join(out)).strip()
+
+
+def _latin_variants(text: str) -> set[str]:
+    base = _latinize_track_text(text)
+    variants = {base}
+    variants.add(base.replace("jj", "y"))
+    variants.add(base.replace("j", "y"))
+    expanded: set[str] = set()
+    for variant in variants:
+        expanded.add(variant)
+        expanded.add(re.sub(r"yy\b", "yi", variant))
+        expanded.add(re.sub(r"iy\b", "i", variant))
+        expanded.add(re.sub(r"ovy\b", "ovyi", variant))
+    return {re.sub(r"\s+", " ", item).strip() for item in expanded if item.strip()}
+
+
+def _phonetic_fold_latin(text: str) -> str:
+    folded = normalize_track_text(text)
+    replacements = (
+        ("shch", "sch"),
+        ("yo", "e"),
+        ("jo", "e"),
+        ("yu", "u"),
+        ("ya", "a"),
+        ("ts", "c"),
+        ("zh", "j"),
+    )
+    for src, dst in replacements:
+        folded = folded.replace(src, dst)
+    return re.sub(r"\s+", " ", folded).strip()
+
+
+def _compress_repeats(text: str) -> str:
+    return re.sub(r"(.)\1{2,}", r"\1", text)
+
+
 def _has_phrase(norm_text: str, phrase: str) -> bool:
     phrase_norm = normalize_track_text(phrase)
     return bool(re.search(rf"(?<!\w){re.escape(phrase_norm)}(?!\w)", norm_text))
@@ -196,7 +297,7 @@ def _detect_version_flags(text: str) -> set[str]:
 
     _add_if_any(flags, negative_scan, "clean", ["clean", "clean version", "без мата", "bez mata", "чистая версия"])
     _add_if_any(flags, negative_scan, "censored", ["censored", "censored version", "цензура", "цензурная версия"])
-    _add_if_any(flags, negative_scan, "edited", ["edited", "edited version"])
+    _add_if_any(flags, negative_scan, "edited", ["edited", "edited version", "reyk edit", "dnb edit"])
     _add_if_any(flags, negative_scan, "safe", ["safe version", "radio safe"])
     _add_if_any(flags, negative_scan, "radio", ["radio edit", "radio version", "radio mix", "radio cut"])
     _add_if_any(flags, negative_scan, "short", ["short", "short version", "short edit", "cut version"])
@@ -213,6 +314,11 @@ def _detect_version_flags(text: str) -> set[str]:
     _add_if_any(flags, negative_scan, "cover", ["cover", "cover version"])
     _add_if_any(flags, negative_scan, "acoustic", ["acoustic", "acoustic version"])
     _add_if_any(flags, negative_scan, "demo", ["demo", "demo version"])
+    _add_if_any(flags, negative_scan, "bassboost", ["low bass", "bass boost", "bassboost", "low bass by"])
+    if re.search(r"\b\d{2,3}(?:-\d{2,3})?hz\b", negative_scan):
+        flags.add("bassboost")
+    if "bassline.ru" in negative_scan or "v shishku" in negative_scan:
+        flags.add("bassboost")
 
     _add_if_any(flags, norm, "explicit", ["explicit"])
     _add_if_any(flags, norm, "dirty", ["dirty", "dirty version"])
@@ -247,8 +353,8 @@ def should_hard_reject_candidate(
         return True, STATUS_REJECTED_RADIO_VERSION
     if candidate_flags & {"short", "preview", "snippet"} and not (input_flags & {"short", "preview", "snippet"}):
         return True, STATUS_REJECTED_SHORT_VERSION
-    if candidate_flags & {"remix", "slowed", "reverb", "nightcore", "sped_up", "cover", "acoustic", "demo"} and not (
-        input_flags & {"remix", "slowed", "reverb", "nightcore", "sped_up", "cover", "acoustic", "demo"}
+    if candidate_flags & {"remix", "slowed", "reverb", "nightcore", "sped_up", "cover", "acoustic", "demo", "bassboost"} and not (
+        input_flags & {"remix", "slowed", "reverb", "nightcore", "sped_up", "cover", "acoustic", "demo", "bassboost"}
     ):
         return True, STATUS_REJECTED_REMIX_VERSION
     if "live" in candidate_flags and "live" not in input_flags:
@@ -261,10 +367,10 @@ def should_hard_reject_candidate(
 def _parse_artist_title(raw: str) -> tuple[str, str]:
     raw = raw.strip()
     if " - " in raw:
-        artist, title = raw.rsplit(" - ", 1)
+        artist, title = raw.split(" - ", 1)
         return artist.strip(), title.strip()
     if "-" in raw:
-        artist, title = raw.rsplit("-", 1)
+        artist, title = raw.split("-", 1)
         return artist.strip(), title.strip()
     return "", raw
 
@@ -276,6 +382,8 @@ def generate_search_queries(input_track: str) -> list[str]:
 
     artist, title = _parse_artist_title(raw)
     input_flags = detect_requested_version_flags(raw)
+    clean_artist = _strip_version_markers_for_match(artist) if artist else ""
+    clean_title = _strip_version_markers_for_match(title) if title else _strip_version_markers_for_match(raw)
     out: list[str] = []
 
     def add(q: str) -> None:
@@ -287,11 +395,24 @@ def generate_search_queries(input_track: str) -> list[str]:
     if artist and title:
         add(f"{artist} {title}")
         add(f"{title} {artist}")
+        if clean_title and clean_title.casefold() != title.casefold():
+            add(f"{artist} - {clean_title}")
+            add(f"{artist} {clean_title}")
+            add(f"{clean_title} {artist}")
+        if clean_artist and clean_title and (clean_artist.casefold() != artist.casefold() or clean_title.casefold() != title.casefold()):
+            add(f"{clean_artist} - {clean_title}")
+            add(f"{clean_artist} {clean_title}")
+            add(f"{clean_title} {clean_artist}")
     else:
         add(raw.replace(" - ", " "))
+        if clean_title and clean_title.casefold() != raw.casefold():
+            add(clean_title)
 
     if not (input_flags & {"clean", "censored", "edited", "safe", "radio"}):
-        base = f"{artist} {title}".strip() if artist and title else raw
+        if artist and title:
+            base = f"{clean_artist or artist} {clean_title or title}".strip()
+        else:
+            base = clean_title or raw
         for suffix in ("explicit", "uncensored", "original", "full version", "album version"):
             add(f"{base} {suffix}")
 
@@ -300,6 +421,13 @@ def generate_search_queries(input_track: str) -> list[str]:
 
 def _token_set(text: str) -> set[str]:
     return {tok for tok in normalize_track_text(text).split() if len(tok) > 1}
+
+
+def _token_set_latin(text: str) -> set[str]:
+    out: set[str] = set()
+    for variant in _latin_variants(text):
+        out.update(tok for tok in variant.split() if len(tok) > 1)
+    return out
 
 
 def _ratio(a: str, b: str) -> float:
@@ -314,6 +442,36 @@ def _ratio(a: str, b: str) -> float:
     tb = set(b.split())
     overlap = len(ta & tb) / max(1, len(ta | tb))
     return max(seq, overlap)
+
+
+def _cross_script_ratio(a: str, b: str) -> float:
+    best = _ratio(a, b)
+    latin_a = _latin_variants(a)
+    latin_b = _latin_variants(b)
+    for left in latin_a:
+        for right in latin_b:
+            best = max(best, _ratio(left, right))
+            folded_left = _phonetic_fold_latin(left)
+            folded_right = _phonetic_fold_latin(right)
+            best = max(best, _ratio(folded_left, folded_right))
+            best = max(best, _ratio(_compress_repeats(folded_left), _compress_repeats(folded_right)))
+    return best
+
+
+def _cross_script_token_overlap(a: str, b: str) -> float:
+    plain_a = _token_set(a)
+    plain_b = _token_set(b)
+    latin_a = _token_set_latin(a)
+    latin_b = _token_set_latin(b)
+    plain_overlap = len(plain_a & plain_b) / max(1, len(plain_a | plain_b))
+    latin_overlap = len(latin_a & latin_b) / max(1, len(latin_a | latin_b))
+    folded_a = {tok for item in _latin_variants(a) for tok in _phonetic_fold_latin(item).split() if len(tok) > 1}
+    folded_b = {tok for item in _latin_variants(b) for tok in _phonetic_fold_latin(item).split() if len(tok) > 1}
+    folded_overlap = len(folded_a & folded_b) / max(1, len(folded_a | folded_b))
+    compressed_a = {_compress_repeats(tok) for tok in folded_a}
+    compressed_b = {_compress_repeats(tok) for tok in folded_b}
+    compressed_overlap = len(compressed_a & compressed_b) / max(1, len(compressed_a | compressed_b))
+    return max(plain_overlap, latin_overlap, folded_overlap, compressed_overlap)
 
 
 def _strip_version_markers_for_match(text: str) -> str:
@@ -364,7 +522,23 @@ def _strip_version_markers_for_match(text: str) -> str:
         "цензурная версия",
         "чистая версия",
     ]
-    return _remove_phrases(norm, phrases)
+    stripped = _remove_phrases(norm, phrases)
+    stripped = re.sub(r"\b(?:bassline(?:\.ru)?|v shishku)\b", " ", stripped)
+    stripped = re.sub(r"\b\d{2,3}(?:-\d{2,3})?hz\b", " ", stripped)
+    stripped = re.sub(r"\blow bass by\b.*$", " ", stripped).strip()
+    stripped = re.sub(r"\blow bass\b.*$", " ", stripped).strip()
+    stripped = re.sub(r"\b(?:feat|ft|featuring)\b.*$", " ", stripped).strip()
+    stripped = re.sub(r"\bprod(?:uced)?\.?\s*by\b.*$", " ", stripped).strip()
+    stripped = re.sub(r"\bprod\.?\b.*$", " ", stripped).strip()
+    return re.sub(r"\s+", " ", stripped).strip()
+
+
+def _is_short_single_token_title(text: str) -> bool:
+    tokens = [tok for tok in _token_set(text) if tok]
+    if len(tokens) != 1:
+        return False
+    token = tokens[0]
+    return len(token) <= 4 or token.isdigit()
 
 
 def _provider_score(provider: str) -> float:
@@ -400,20 +574,38 @@ def score_candidate(input_track: str, candidate: TrackCandidate) -> MatchScore:
     input_flags = detect_requested_version_flags(input_track)
     hard_reject, reason = should_hard_reject_candidate(input_flags, flags)
 
-    artist_score = _ratio(in_artist, cand_artist) if in_artist and cand_artist else 0.55
-    title_score = _ratio(_strip_version_markers_for_match(in_title), _strip_version_markers_for_match(cand_title or candidate.raw_display_title))
+    input_title = _strip_version_markers_for_match(in_title or input_track)
+    candidate_title = _strip_version_markers_for_match(cand_title or candidate.raw_display_title)
+    artist_score = _cross_script_ratio(in_artist, cand_artist) if in_artist and cand_artist else 0.55
+    if in_artist and cand_artist:
+        artist_score = max(artist_score, _cross_script_token_overlap(in_artist, cand_artist))
+    title_ratio = _cross_script_ratio(input_title, candidate_title)
+    title_token_score = _cross_script_token_overlap(input_title, candidate_title)
+    title_score = max(title_ratio, min(1.0, title_token_score))
+    display_title = candidate.raw_display_title or candidate_text
+    combined_display_score = _cross_script_ratio(input_track, display_title)
 
-    input_tokens = _token_set(input_track)
-    candidate_tokens = _token_set(candidate_text)
-    token_score = len(input_tokens & candidate_tokens) / max(1, len(input_tokens))
-    title_score = max(title_score, min(1.0, token_score))
+    if not in_title or not (cand_title or candidate.raw_display_title):
+        title_score = max(title_score, min(1.0, _cross_script_token_overlap(input_track, candidate_text)))
+    elif title_token_score == 0 and title_ratio < 0.35:
+        title_score = min(title_score, 0.2)
+
+    # Some providers return a single combined "Artist Title" string without a clean separator.
+    # If the whole display line matches well, trust that more than the broken artist/title split.
+    if combined_display_score >= 0.9 and (" - " not in display_title or not cand_artist or not cand_title):
+        artist_score = max(artist_score, min(0.9, combined_display_score))
+        title_score = max(title_score, min(0.9, combined_display_score))
 
     duration_score: float | None = None
     version_score = 0.72
     if flags & POSITIVE_VERSION_FLAGS:
         version_score += min(0.18, 0.06 * len(flags & POSITIVE_VERSION_FLAGS))
-    if flags & NEGATIVE_VERSION_FLAGS:
-        version_score -= min(0.45, 0.12 * len(flags & NEGATIVE_VERSION_FLAGS))
+    requested_version_flags = flags & NEGATIVE_VERSION_FLAGS & input_flags
+    unrequested_version_flags = (flags & NEGATIVE_VERSION_FLAGS) - input_flags
+    if requested_version_flags:
+        version_score += min(0.12, 0.04 * len(requested_version_flags))
+    if unrequested_version_flags:
+        version_score -= min(0.45, 0.12 * len(unrequested_version_flags))
     if hard_reject:
         version_score = min(version_score, 0.05)
     version_score = max(0.0, min(1.0, version_score))
@@ -425,6 +617,16 @@ def score_candidate(input_track: str, candidate: TrackCandidate) -> MatchScore:
         + version_score * 0.20
         + provider_score * 0.10
     )
+    if in_artist and cand_artist and title_score < 0.35:
+        final = min(final, 0.59)
+    if (
+        in_artist
+        and cand_artist
+        and _is_short_single_token_title(input_title)
+        and title_score >= 0.9
+        and artist_score < 0.55
+    ):
+        final = min(final, 0.64)
     if hard_reject:
         final = min(final, 0.49)
     final = max(0.0, min(1.0, final))
@@ -436,6 +638,11 @@ def score_candidate(input_track: str, candidate: TrackCandidate) -> MatchScore:
     candidate.hard_reject = hard_reject
     candidate.reject_reason = reason
     candidate.score = round(final, 4)
+    candidate.artist_score = round(artist_score, 4)
+    candidate.title_score = round(title_score, 4)
+    candidate.duration_score = round(duration_score, 4) if duration_score is not None else None
+    candidate.version_score = round(version_score, 4)
+    candidate.provider_score = round(provider_score, 4)
 
     return MatchScore(
         final_score=round(final, 4),

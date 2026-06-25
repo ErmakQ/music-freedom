@@ -353,6 +353,7 @@ CHROME_UA = (
 DEFAULT_SITE_ORIGIN = "https://eu.hitmoz.com"
 DEFAULT_LMUSIC_ORIGIN = "https://lmusic.kz"
 DEFAULT_ZVYKI_ORIGIN = "https://zvyki.com"
+DEFAULT_SKYSOUND_ORIGIN = "https://skysound7.com"
 DEFAULT_MP3_MIRROR_HOSTS = (
     "eu.hitmoz.com",
     "eu.hitmotop.com",
@@ -365,6 +366,7 @@ class DownloadConfig:
     site_origin: str = DEFAULT_SITE_ORIGIN
     lmusic_origin: str = DEFAULT_LMUSIC_ORIGIN
     zvyki_origin: str = DEFAULT_ZVYKI_ORIGIN
+    skysound_origin: str = DEFAULT_SKYSOUND_ORIGIN
     headless: bool = True
     wait_sec: int = 25
     delay_sec: float = 0.5
@@ -401,6 +403,7 @@ class DownloadConfig:
     # Fallback-поиск на lmusic.kz для треков, которые не нашлись на основном сайте.
     lmusic_fallback_enabled: bool = True
     zvyki_fallback_enabled: bool = True
+    skysound_fallback_enabled: bool = True
 
 
 _STOP_WORKER = object()
@@ -1099,6 +1102,8 @@ def score_mp3_url_path(href: str, raw: str, artist: str, title: str) -> int:
 def _display_title_from_download_url(download_url: str, referer: str | None = None) -> str:
     base = urllib.parse.unquote(basename_from_mp3_url(download_url))
     base = base.replace("+", " ").replace("_-_", " - ").replace("_", " ")
+    base = re.sub(r"\(\s*skysound(?:\.cc|7\.com)?\s*\)", " ", base, flags=re.I)
+    base = re.sub(r"\bskysound(?:\.cc|7\.com)?\b", " ", base, flags=re.I)
     base = re.sub(r"\b\d{4,}$", "", base).strip(" -_")
     base = re.sub(r"\s+", " ", base).strip()
     if base and base.lower() not in {"download", "file", "track", "audio"}:
@@ -1106,7 +1111,7 @@ def _display_title_from_download_url(download_url: str, referer: str | None = No
     if referer:
         ref_path = urllib.parse.unquote(urllib.parse.urlparse(referer).path)
         ref_base = os.path.basename(ref_path.rstrip("/"))
-        ref_base = ref_base.replace("-", " ").replace("_", " ")
+        ref_base = ref_base.replace("+", " ").replace("-", " ").replace("_", " ")
         ref_base = re.sub(r"\s+", " ", ref_base).strip()
         if ref_base:
             return ref_base
@@ -1292,6 +1297,7 @@ def _resolve_quality_plan(
         LMusicHTTPProvider,
         SearchOrchestrator,
         SeleniumFallbackProvider,
+        SkySoundHTTPProvider,
         TrackQuery,
         ZvykiHTTPProvider,
     )
@@ -1305,6 +1311,8 @@ def _resolve_quality_plan(
         enabled_providers.append("lmusic:http")
     if cfg.zvyki_fallback_enabled:
         enabled_providers.append("zvyki:http")
+    if cfg.skysound_fallback_enabled:
+        enabled_providers.append("skysound:http")
     if cfg.enable_selenium_fallback:
         enabled_providers.append("selenium:fallback")
     track = TrackQuery(
@@ -1321,6 +1329,7 @@ def _resolve_quality_plan(
             "provider_origins": {
                 "hitmo": cfg.site_origin,
                 "lmusic": cfg.lmusic_origin,
+                "skysound": cfg.skysound_origin,
                 "zvyki": cfg.zvyki_origin,
             },
             "search_logic_version": SEARCH_LOGIC_VERSION,
@@ -1338,7 +1347,7 @@ def _resolve_quality_plan(
     if cfg.enable_selenium_fallback and driver is not None and wait is not None:
         selenium_provider = SeleniumFallbackProvider(cfg, driver, wait)
     orchestrator = SearchOrchestrator(
-        [HitmoHTTPProvider(cfg), LMusicHTTPProvider(cfg), ZvykiHTTPProvider(cfg)],
+        [HitmoHTTPProvider(cfg), LMusicHTTPProvider(cfg), ZvykiHTTPProvider(cfg), SkySoundHTTPProvider(cfg)],
         selenium_provider=selenium_provider,
         cache=cache,
         http_concurrency=cfg.http_search_concurrency,
@@ -1440,6 +1449,8 @@ def _find_lmusic_plan_via_selenium(
     artist, title = parse_artist_title(raw_song_query)
     search_url = cfg.lmusic_origin.rstrip("/")
     track_urls: list[str] = []
+    selector_wait = _short_selenium_wait(driver, cfg, cap_sec=3)
+    page_wait = _short_selenium_wait(driver, cfg, cap_sec=4)
     try:
         driver.get(search_url)
         selectors = [
@@ -1451,7 +1462,7 @@ def _find_lmusic_plan_via_selenium(
         search_input = None
         for selector in selectors:
             try:
-                search_input = wait.until(
+                search_input = selector_wait.until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, selector))
                 )
                 if search_input:
@@ -1483,7 +1494,7 @@ def _find_lmusic_plan_via_selenium(
         for song_page_url in track_urls[:5]:
             try:
                 driver.get(song_page_url)
-                wait.until(lambda d: "/mp3/" in (d.current_url or "") or "/api/download/" in d.page_source)
+                page_wait.until(lambda d: "/mp3/" in (d.current_url or "") or "/api/download/" in d.page_source)
             except TimeoutException:
                 pass
 
@@ -1512,6 +1523,7 @@ def _find_lmusic_plan_via_selenium(
 def load_search_results_page(
     driver, wait: WebDriverWait, search_url: str, cfg: DownloadConfig
 ) -> None:
+    round_wait = _short_selenium_wait(driver, cfg, cap_sec=4)
     try:
         driver.get(search_url)
     except TimeoutException:
@@ -1519,7 +1531,7 @@ def load_search_results_page(
     rounds = max(1, min(6, cfg.search_load_rounds))
     for attempt in range(rounds):
         try:
-            wait.until(
+            round_wait.until(
                 EC.presence_of_element_located(
                     (By.CSS_SELECTOR, "a.track__download-btn")
                 )
@@ -1619,6 +1631,21 @@ def http_download_mp3(
     return file_path
 
 
+def _effective_selenium_wait_sec(cfg: DownloadConfig) -> int:
+    provider_timeout = cfg.provider_timeout_sec
+    if provider_timeout in (None, ""):
+        return max(5, int(cfg.wait_sec))
+    try:
+        return max(5, min(int(cfg.wait_sec), int(float(provider_timeout))))
+    except (TypeError, ValueError):
+        return max(5, int(cfg.wait_sec))
+
+
+def _short_selenium_wait(driver, cfg: DownloadConfig, *, cap_sec: int = 4) -> WebDriverWait:
+    timeout = max(2, min(cap_sec, _effective_selenium_wait_sec(cfg)))
+    return WebDriverWait(driver, timeout)
+
+
 def create_driver(cfg: DownloadConfig):
     ensure_chromedriver_installed()
     options = webdriver.ChromeOptions()
@@ -1631,10 +1658,10 @@ def create_driver(cfg: DownloadConfig):
         driver = webdriver.Chrome(service=Service(cd_path), options=options)
     else:
         driver = webdriver.Chrome(options=options)
-    timeout = max(5, int(cfg.wait_sec))
+    timeout = _effective_selenium_wait_sec(cfg)
     driver.set_page_load_timeout(timeout)
     driver.set_script_timeout(timeout)
-    wait = WebDriverWait(driver, cfg.wait_sec)
+    wait = WebDriverWait(driver, timeout)
     return driver, wait
 
 
@@ -1652,6 +1679,7 @@ def _find_plan_via_selenium(
     artist, title = parse_artist_title(raw_song_query)
     encoded_song = urllib.parse.quote(song_query, safe="")
     search_url = f"{cfg.site_origin}/search?q={encoded_song}"
+    page_wait = _short_selenium_wait(driver, cfg, cap_sec=4)
 
     try:
         load_search_results_page(driver, wait, search_url, cfg)
@@ -1675,7 +1703,7 @@ def _find_plan_via_selenium(
         for song_page_url in collect_track_page_urls(driver, cfg.site_origin):
             try:
                 driver.get(song_page_url)
-                btn = wait.until(
+                btn = page_wait.until(
                     EC.presence_of_element_located(
                         (By.CSS_SELECTOR, "a.track__download-btn")
                     )
@@ -1993,6 +2021,8 @@ def _run_resolved_download(
     last_error: str | None = None
     last_url: str | None = None
     last_item: dict | None = None
+    best_rejected_item: dict | None = None
+    best_rejected_score = -1.0
     candidates = rt.candidates or [
         _candidate_from_attempt("legacy", rt.raw_song_query, rt.raw_song_query, attempt)
         for attempt in rt.attempts
@@ -2066,8 +2096,14 @@ def _run_resolved_download(
             file=rejected_path,
             url=used_url,
         )
+        candidate_score = float(candidate.score or 0.0)
+        if candidate_score >= best_rejected_score:
+            best_rejected_score = candidate_score
+            best_rejected_item = last_item
         last_error = reason
 
+    if best_rejected_item is not None:
+        last_item = best_rejected_item
     if last_item is None:
         last_item = quality_layer.make_quality_item(
             rt.raw_song_query,

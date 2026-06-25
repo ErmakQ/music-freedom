@@ -449,6 +449,20 @@
 .bottom-grid {
   grid-template-columns: minmax(0, 1fr) minmax(320px, 0.85fr) minmax(320px, 0.85fr);
   margin-top: 1rem;
+  align-items: start;
+}
+
+.bottom-grid > .card {
+  min-height: 0;
+}
+
+.preview-card {
+  height: var(--preview-card-height, auto);
+  max-height: var(--preview-card-height, none);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .results-grid {
@@ -883,7 +897,8 @@
 .track-list {
   display: grid;
   gap: 0.55rem;
-  max-height: 400px;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
   padding-right: 0.2rem;
@@ -1616,8 +1631,9 @@
 }
 
 .problem-select input {
-  width: 18px;
-  height: 18px;
+  width: 27px;
+  height: 27px;
+  cursor: pointer;
 }
 
 .problem-empty {
@@ -1672,6 +1688,9 @@
 
 .manual-review-checkbox input {
   margin: 0;
+  width: 27px;
+  height: 27px;
+  cursor: pointer;
 }
 
 .manual-review-card-head h3,
@@ -1969,6 +1988,7 @@ a:focus-visible,
   .results-grid {
     grid-template-columns: 1fr;
   }
+
 }
 
 @media (max-width: 780px) {
