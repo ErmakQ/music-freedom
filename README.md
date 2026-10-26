@@ -1,10 +1,10 @@
-# music-freedom
+# Музыкальная полка
 
-Локальное Windows-приложение для сборки музыкального архива по плейлисту.
+Локальное Windows-приложение для обработки плейлистов и сборки архива из подходящих аудиофайлов.
 
 Проект принимает список треков, ищет подходящие mp3-кандидаты, скачивает найденные файлы, проверяет качество совпадения и собирает итоговый архив только из принятых треков.
 
-## Что умеет
+## Возможности
 
 - импорт обычного текстового списка треков;
 - загрузка `.txt`, `.m3u`, `.m3u8`;
@@ -19,23 +19,13 @@
 
 ## Быстрый старт
 
-Самый простой запуск на Windows:
+Для Windows скачайте файл `music-shelf-setup.exe` из раздела Releases и запустите установщик.
 
-```bat
-start.bat
-```
+Установщик предложит папку программы. После установки откройте ярлык **«Музыкальная полка»**: приложение само откроет браузер на локальной странице.
 
-Что делает `start.bat`:
+Python и Node.js пользователю не нужны. Значок в системном трее позволяет повторно открыть страницу приложения или полностью завершить работу.
 
-1. создаёт `.env` из `.env.example`, если файла ещё нет;
-2. ищет Python `3.10+`;
-3. если Python не найден, скачивает portable Python `3.11.9` в `.runtime\python`;
-4. создаёт `.venv`;
-5. ставит зависимости из `requirements.txt`;
-6. при необходимости собирает `frontend/dist`;
-7. запускает приложение на `http://127.0.0.1:8000`.
-
-Если `frontend/dist` уже существует, Node.js для обычного запуска не нужен.
+Готовые ZIP-архивы сохраняются браузером в его обычную папку загрузок. Её можно изменить в настройках браузера.
 
 ## Как пользоваться
 
@@ -79,26 +69,20 @@ Google Chrome нужен только для `deep` или если явно в�
 
 В итоговый архив попадают только треки со статусом `OK`.
 
-## Сборка релиза для другого ПК
+## Сборка Windows-релиза
 
-Чтобы подготовить переносимую сборку:
+Для разработчика нужны Python `3.10+`, Node.js `18+` и Inno Setup 6 для создания установщика.
 
-```bat
-prepare_release.bat
+```powershell
+.\.venv\Scripts\python.exe build_exe.py
 ```
 
-Скрипт:
+Скрипт сам устанавливает сборочные зависимости, собирает frontend и создаёт:
 
-1. ставит frontend-зависимости;
-2. собирает `frontend/dist`;
-3. копирует проект без локальных служебных файлов;
-4. создаёт архив:
+- `release\music-shelf-windows.zip` — переносимая EXE-сборка;
+- `dist\MusicShelf\MusicShelf.exe` — приложение до упаковки установщиком.
 
-```text
-release\music-freedom-release.zip
-```
-
-На другом Windows-ПК обычно достаточно распаковать архив и запустить `start.bat`.
+Если Inno Setup 6 установлен, скрипт также автоматически создаёт `release\music-shelf-setup.exe`.
 
 ## Ручной запуск для разработки
 
@@ -140,7 +124,7 @@ Frontend dev по умолчанию открывается через Vite, о�
 
 ## Основные настройки
 
-Пример настроек лежит в [`.env.example`](E:/Music_Download/muzik_maks/.env.example).
+Пример настроек лежит в [`.env.example`](.env.example).
 
 Чаще всего важны:
 
@@ -157,15 +141,16 @@ Frontend dev по умолчанию открывается через Vite, о�
 
 ## Структура проекта
 
-- [web/app.py](E:/Music_Download/muzik_maks/web/app.py) — FastAPI backend и web API.
-- [frontend/src/App.tsx](E:/Music_Download/muzik_maks/frontend/src/App.tsx) — основной React-интерфейс.
-- [downloader_core.py](E:/Music_Download/muzik_maks/downloader_core.py) — основной pipeline поиска и скачивания.
-- [quality.py](E:/Music_Download/muzik_maks/quality.py) — quality layer, статусы и валидация.
-- [search/](E:/Music_Download/muzik_maks/search) — HTTP/Selenium search layer и кэш.
-- [playlist_importers/](E:/Music_Download/muzik_maks/playlist_importers) — импорт плейлистов из текста, URL, iframe и HTML.
-- [prepare_release.bat](E:/Music_Download/muzik_maks/prepare_release.bat) — сборка переносимого релиза.
-- [README_OVERVIEW.md](E:/Music_Download/muzik_maks/README_OVERVIEW.md) — расширенный технический обзор.
-- [CODEX_PROJECT_CONTEXT.md](E:/Music_Download/muzik_maks/CODEX_PROJECT_CONTEXT.md) — рабочий контекст и заметки по проекту.
+- [web/app.py](web/app.py) — FastAPI backend и web API.
+- [frontend/src/App.tsx](frontend/src/App.tsx) — основной React-интерфейс.
+- [downloader_core.py](downloader_core.py) — основной pipeline поиска и скачивания.
+- [quality.py](quality.py) — quality layer, статусы и валидация.
+- [search/](search) — HTTP/Selenium search layer и кэш.
+- [playlist_importers/](playlist_importers) — импорт плейлистов из текста, URL, iframe и HTML.
+- [desktop.py](desktop.py) — EXE-лаунчер с иконкой в системном трее.
+- [build_exe.py](build_exe.py) — сборка EXE-пакета для Windows.
+- [installer.iss](installer.iss) — сценарий установщика Inno Setup.
+- [README_OVERVIEW.md](README_OVERVIEW.md) — расширенный технический обзор.
 
 ## Проверка
 
@@ -189,3 +174,28 @@ python -m unittest
 - Некоторые треки могут уйти в `manual_review`.
 - Сохранённые HTML-страницы плейлистов могут содержать личные данные профиля.
 - Проект не предназначен для обхода DRM, paywall, авторизации, антибот-защиты или региональных ограничений.
+- Пользователь самостоятельно отвечает за соблюдение законов, условий сервисов и прав правообладателей.
+
+## Поддержать проект
+
+Если «Музыкальная полка» оказалась полезной, можно добровольно поддержать её развитие:
+
+[Поддержать проект через CloudTips](https://pay.cloudtips.ru/p/913f18f5)
+
+Поддержка не открывает платные функции и не влияет на возможности приложения.
+
+## Лицензия
+
+Проект распространяется по [PolyForm Noncommercial 1.0.0](LICENSE). Личное, образовательное и другое некоммерческое использование разрешено; для коммерческого использования требуется отдельное разрешение правообладателя.
+
+## Участие в разработке
+
+Перед pull request проверьте изменения локально:
+
+```bat
+python -m unittest
+cd frontend
+npm run build
+```
+
+Для сообщений об уязвимостях смотрите [SECURITY.md](SECURITY.md).

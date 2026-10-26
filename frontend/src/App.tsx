@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, Dispatch, DragEvent, RefObject, SetStateAction } from "react";
 import "./App.css";
 
-const PRODUCT_NAME = "Музыка Свободы";
+const PRODUCT_NAME = "Музыкальная полка";
 const PRODUCT_SUBTITLE = "Оригинальные версии треков в одном архиве";
 const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? "";
 const PREFS_KEY = "playlistWeb.v2";

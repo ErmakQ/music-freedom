@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import shutil
+import sys
 import tempfile
 import threading
 import urllib.parse
@@ -44,8 +45,17 @@ from playlist_importers import import_playlist as import_playlist_content
 from playlist_importers import save_imported_playlist
 from playlist_importers.preview_diagnostics import analyze_preview_tracks
 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(_PROJECT_ROOT / ".env")
+def _resource_root() -> Path:
+    """Return bundled resources for EXE builds and the repository root in development."""
+    if getattr(sys, "frozen", False):
+        return Path(sys._MEIPASS)  # type: ignore[attr-defined]
+    return Path(__file__).resolve().parent.parent
+
+
+_PROJECT_ROOT = _resource_root()
+_DATA_ROOT = Path(os.getenv("MUSIC_SHELF_DATA_DIR", str(_PROJECT_ROOT))).expanduser().resolve()
+_DATA_ROOT.mkdir(parents=True, exist_ok=True)
+load_dotenv(_DATA_ROOT / ".env")
 load_dotenv()
 
 logging.basicConfig(
@@ -61,8 +71,8 @@ _WEB_SESSION_SECRET = os.getenv("WEB_SESSION_SECRET", "").strip()
 WEB_SESSION_ENABLED = bool(_WEB_SESSION_SECRET)
 _MAX_UPLOAD_BYTES = max(0, int(os.getenv("WEB_MAX_UPLOAD_BYTES", "524288")))  # 512 KiB
 _MAX_IMPORT_UPLOAD_BYTES = max(0, int(os.getenv("WEB_IMPORT_MAX_UPLOAD_BYTES", "10485760")))  # 10 MiB
-_WEB_FAILED_RUNS_DIR = _PROJECT_ROOT / "downloaded_music" / "web_runs"
-_WEB_IMPORTS_DIR = _PROJECT_ROOT / "downloaded_music" / "imports"
+_WEB_FAILED_RUNS_DIR = _DATA_ROOT / "downloaded_music" / "web_runs"
+_WEB_IMPORTS_DIR = _DATA_ROOT / "downloaded_music" / "imports"
 
 _SPEED_PRESETS = {
     "fast": {
@@ -114,7 +124,7 @@ async def lifespan(app: FastAPI):
     log.info("Web API: executor остановлен")
 
 
-app = FastAPI(title="Playlist downloader API", lifespan=lifespan)
+app = FastAPI(title="Музыкальная полка API", lifespan=lifespan)
 
 _cors = os.getenv("WEB_CORS_ORIGINS", _DEFAULT_CORS).strip()
 _origins = [o.strip() for o in _cors.split(",") if o.strip()]
