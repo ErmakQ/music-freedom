@@ -10,6 +10,7 @@ AppPublisher=Музыкальная полка
 DefaultDirName={autopf}\Music Shelf
 DefaultGroupName={#AppName}
 LicenseFile=LICENSE
+SetupIconFile=assets\music-shelf.ico
 DisableProgramGroupPage=yes
 OutputDir=release
 OutputBaseFilename=music-shelf-setup

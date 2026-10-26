@@ -56,6 +56,8 @@ def main() -> None:
         "--windowed",
         "--name",
         APP_NAME,
+        "--icon",
+        "assets/music-shelf.ico",
         "--add-data",
         f"frontend/dist{data_separator}frontend/dist",
         "--add-data",
