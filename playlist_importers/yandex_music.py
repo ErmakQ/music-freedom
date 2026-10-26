@@ -59,6 +59,11 @@ WARNING_URL_ONLY = (
     "но Яндекс Музыка может вернуть страницу входа или неполные данные. "
     "Если треки не появились, загрузите сохраненный HTML страницы плейлиста."
 )
+WARNING_PLAYLIST_ACCESS = (
+    "YANDEX_PLAYLIST_ACCESS: Яндекс Музыка не отдала список треков по ссылке. "
+    "Это может произойти даже с публичным пользовательским плейлистом. "
+    "Откройте плейлист в браузере, прокрутите список до конца, сохраните страницу как HTML и загрузите этот файл."
+)
 
 
 _URL_RE = re.compile(r"https?://music\.yandex\.(?:ru|com|kz|by|uz)[^\s\"'<>]+", re.I)
@@ -479,7 +484,7 @@ def parse_yandex_playlist_url(url: str) -> ImportedPlaylist:
             fetched.warnings.append(f"{err}: owner/kind не удалось извлечь из URL.")
         return fetched
 
-    warnings = [WARNING_URL_ONLY]
+    warnings = [WARNING_URL_ONLY, WARNING_PLAYLIST_ACCESS]
     warnings.extend(warnings_from_api)
     warnings.extend(fetched.warnings)
     if err:

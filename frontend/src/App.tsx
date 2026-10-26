@@ -667,14 +667,14 @@ function detectImportAnalysis(tab: ImportTab, content: string, file: File | null
     };
   }
 
-  const linkMatch = trimmed.match(/https?:\/\/music\.yandex\.ru\/[^\s"'<>]+/i);
+  const linkMatch = trimmed.match(/https?:\/\/music\.yandex\.(?:ru|com|kz|by|uz)\/[^\s"'<>]+/i);
   if (linkMatch) {
     return {
       kind: "link",
       label: "Ссылка на плейлист",
       sourceUrl: linkMatch[0],
       messages: [
-        "Ссылка распознана. Если по ссылке нельзя получить список треков, сохраните страницу плейлиста как HTML или используйте txt-файл.",
+        "Ссылка распознана. Если Яндекс Музыка не отдаст список треков, сохраните открытую страницу плейлиста как HTML или используйте txt-файл.",
       ],
     };
   }
@@ -938,8 +938,8 @@ function ImportCard({
           ))}
           {importResult?.track_count === 0 && (analysis.kind === "iframe" || analysis.kind === "link" || analysis.kind === "html") ? (
             <p>
-              Плейлист распознан как ссылка или iframe, но список треков не найден. Загрузите сохраненный HTML-файл
-              страницы или обычный txt-файл.
+              Яндекс Музыка не отдала список треков по этой ссылке. Откройте плейлист в браузере, прокрутите список
+              до конца, сохраните страницу как HTML и загрузите этот файл.
             </p>
           ) : null}
           {importResult?.warnings?.map((warning) => (
@@ -956,9 +956,9 @@ function ImportCard({
               <strong>Как это работает</strong>
               <p>
                 Можно вставить обычную ссылку вида <code>music.yandex.ru/users/.../playlists/...</code> или весь
-                iframe-код. Ссылка и iframe помогают распознать плейлист, но не всегда содержат полный список треков.
-                Для полного импорта откройте плейлист, прокрутите его до конца, сохраните страницу как HTML и загрузите
-                файл во вкладке «TXT / HTML-файл».
+                iframe-код. Иногда Яндекс Музыка не отдаёт список по ссылке даже для публичного плейлиста. В этом
+                случае откройте плейлист, прокрутите его до конца, сохраните страницу как HTML и загрузите файл во
+                вкладке «TXT / HTML-файл».
               </p>
             </div>
           )}
@@ -1607,6 +1607,7 @@ function HelpModal({ onClose }: { onClose: () => void }) {
             <ul className="modal-list">
               <li>Откройте плейлист в Яндекс Музыке и нажмите «Поделиться».</li>
               <li>Можно вставить обычную ссылку на плейлист или iframe-код целиком.</li>
+              <li>Если Яндекс не отдаёт список по ссылке, сохраните открытую страницу после прокрутки как HTML.</li>
               <li>Поддерживаются адреса вида music.yandex.ru/playlists/..., /users/owner/playlists/kind и /iframe/playlist/owner/kind.</li>
               <li>Яндекс Музыка используется только как источник списка треков и metadata. Аудио оттуда не скачивается.</li>
             </ul>

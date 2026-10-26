@@ -110,6 +110,20 @@ class PlaylistImporterTests(unittest.TestCase):
         playlist = parse_yandex_playlist_url("https://music.yandex.ru/users/max.ipatow/playlists/3")
         self.assertEqual(playlist.owner, "max.ipatow")
         self.assertEqual(playlist.kind, "3")
+        self.assertTrue(any("YANDEX_PLAYLIST_ACCESS" in warning for warning in playlist.warnings))
+
+    @patch("playlist_importers.yandex_music._playlist_from_remote_html")
+    @patch("playlist_importers.yandex_music._playlist_from_public_api")
+    def test_parse_regular_user_playlist_iframe(self, mocked_public_api, mocked_remote_html) -> None:
+        mocked_public_api.return_value = None
+        mocked_remote_html.return_value = import_playlist(content="")
+        iframe = '''<iframe src="https://music.yandex.ru/iframe/playlist/max.ipatow/1000">
+          Слушайте <a href="https://music.yandex.ru/playlists/88db0920-deeb-0bf9-bf17-fe9921f6de06">Богоподобная мразь</a>
+        </iframe>'''
+        playlist = parse_yandex_iframe(iframe)
+        self.assertEqual(playlist.owner, "max.ipatow")
+        self.assertEqual(playlist.kind, "1000")
+        self.assertEqual(playlist.title, "Богоподобная мразь")
 
     @patch("playlist_importers.yandex_music._playlist_from_remote_html")
     @patch("playlist_importers.yandex_music._playlist_from_public_api")
